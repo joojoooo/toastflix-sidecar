@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sidecar-ui
+    name: sidecar
     runtime: image
     plan: free
     image:
