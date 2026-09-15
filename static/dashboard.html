@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ToastFlix Audio Control</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/dashboard" aria-label="ToastFlix audio control home">
+        <span class="brand-mark">T</span>
+        <span><strong>ToastFlix</strong><small>Audio control room</small></span>
+      </a>
+      <div class="connection">
+        <span id="live-dot" class="dot"></span>
+        <span id="connection-label">Locked</span>
+        <button id="lock-button" class="ghost small" type="button" hidden>Lock</button>
+      </div>
+    </header>
+
+    <section id="login" class="login panel">
+      <div class="eyebrow">Protected console</div>
+      <h1>Hear the fix<br>as it happens.</h1>
+      <p>Enter the <code>SIDECAR_ADMIN_TOKEN</code> from your Render environment. It stays in this browser tab only.</p>
+      <form id="login-form">
+        <label for="admin-token">Dashboard token</label>
+        <div class="token-row">
+          <input id="admin-token" type="password" autocomplete="current-password" required autofocus>
+          <button type="submit">Open console</button>
+        </div>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <div id="console" hidden>
+      <section class="hero">
+        <div>
+          <div class="eyebrow">Live sidecar telemetry</div>
+          <h1>Audio, precisely<br><em>where it belongs.</em></h1>
+        </div>
+        <div class="hero-status panel">
+          <span>Server time</span>
+          <strong id="server-time">—</strong>
+          <span>Remote offset DB</span>
+          <strong id="remote-status">—</strong>
+        </div>
+      </section>
+
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <section>
+        <div class="section-heading">
+          <div>
+            <span class="index">01</span>
+            <h2>Active playback</h2>
+          </div>
+          <p>Edits are picked up by the next HLS request. Already buffered audio may take a moment to catch up.</p>
+        </div>
+        <div id="players" class="player-grid"></div>
+        <div id="no-players" class="empty panel">Waiting for ToastFlix to prepare an audio track…</div>
+      </section>
+
+      <section>
+        <div class="section-heading">
+          <div>
+            <span class="index">02</span>
+            <h2>Offset library</h2>
+          </div>
+          <p>Local records survive while the sidecar disk survives. Upload sends a selected edited record to the configured remote DB.</p>
+        </div>
+        <div class="table-wrap panel">
+          <table>
+            <thead>
+              <tr><th>Media</th><th>Resolution</th><th>Offset</th><th>Rate</th><th>Origin</th><th>Updated</th><th></th></tr>
+            </thead>
+            <tbody id="offset-rows"></tbody>
+          </table>
+          <div id="no-offsets" class="empty">No offset records yet.</div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-heading compact">
+          <div><span class="index">03</span><h2>Recent events</h2></div>
+        </div>
+        <div id="events" class="event-list panel"></div>
+      </section>
+
+      <footer>
+        <span id="server-meta">ToastFlix Audio Sidecar</span>
+        <a href="/docs" target="_blank" rel="noreferrer">API docs ↗</a>
+      </footer>
+    </div>
+  </main>
+  <script src="/dashboard.js" defer></script>
+</body>
+</html>

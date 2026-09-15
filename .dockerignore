@@ -1,0 +1,12 @@
+.git
+.github
+.agents
+.codex
+.env
+.venv
+.test-deps
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+data

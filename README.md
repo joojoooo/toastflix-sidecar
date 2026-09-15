@@ -239,14 +239,52 @@ docker run -d \
 
 ## Offset Audio
 
-Il sidecar mantiene una cache offset locale.
+Il sidecar mantiene una cache offset locale e include una console web per vedere
+in tempo reale il player, l'offset effettivo, il rate, la sorgente della cache e
+i metadati di debug.
+
+Configura una password lunga e casuale:
+
+```env
+SIDECAR_ADMIN_TOKEN=UNA_PASSWORD_LUNGA_E_CASUALE
+```
+
+Poi apri:
+
+```text
+https://audio.example.com/dashboard
+```
+
+Il token resta nella `sessionStorage` della scheda del browser e viene inviato
+solo come header Bearer. Playlist, chiavi, cookie, header di autorizzazione e
+query string firmate vengono esclusi dai metadati mostrati nella console.
+
+La console permette di:
+
+- vedere i playback recenti e distinguere cache hit locale, cache hit remota e
+  nuova misurazione;
+- correggere offset e rate con precisione millisecondo;
+- vedere quando la nuova revisione viene usata da una richiesta HLS;
+- modificare record non piu' attivi nella libreria locale;
+- caricare esplicitamente un record modificato nel DB remoto.
+
+Quando salvi un offset su un playback attivo, il sidecar lo usa sulla successiva
+richiesta playlist/init/segmento. Non puo' svuotare il buffer gia' scaricato da
+Stremio, quindi la correzione udibile puo' arrivare dopo il buffer corrente. Se
+non c'e' un playback attivo, il valore locale personalizzato ha priorita' e viene
+restituito alla successiva lookup compatibile.
 
 Se vuoi salvare e recuperare gli offset anche da un server centrale ToastFlix, imposta nel
 `.env`:
 
 ```env
 OFFSET_API_URL=https://YOUR_TOASTFLIX_HOST/dual/offset
+OFFSET_API_TOKEN=TOKEN_OPZIONALE_DEL_DB
 ```
+
+Il pulsante `Upload remote` e' disponibile solo quando `OFFSET_API_URL` e'
+configurato. Un errore remoto viene mostrato nella console senza perdere il
+record salvato localmente.
 
 Il sidecar invia alla VPS solo metadati:
 
@@ -255,6 +293,22 @@ Il sidecar invia alla VPS solo metadati:
 - offset, rate e confidence.
 
 Non invia alla VPS segmenti audio, chiavi AES o file convertiti.
+
+### Render
+
+Il Blueprint `render.yaml` genera automaticamente `SIDECAR_ADMIN_TOKEN`. Dopo il
+deploy, copialo dalla pagina `Environment` del servizio Render e usalo per
+aprire la console. Imposta inoltre:
+
+```env
+SIDECAR_PUBLIC_URL=https://NOME-SERVIZIO.onrender.com
+OFFSET_API_URL=https://YOUR_TOASTFLIX_HOST/dual/offset
+OFFSET_API_TOKEN=TOKEN_OPZIONALE_DEL_DB
+```
+
+Il filesystem del piano Render gratuito puo' essere effimero. Per conservare gli
+offset tra deploy/restart usa il DB remoto; in alternativa collega un persistent
+disk e imposta `SIDECAR_CACHE_DIR` sul suo mount path.
 
 ## Aggiornare L'immagine
 

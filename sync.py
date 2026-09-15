@@ -400,6 +400,7 @@ class SyncEngine:
             "provider": payload.get("provider", ""),
             "server": payload.get("server", ""),
         })
+        lookup_source = lookup.get("_cache_source") if isinstance(lookup, dict) else None
         lookup_details = lookup.get("details") if isinstance(lookup, dict) else {}
         lookup_status = str(
             (lookup.get("status") if isinstance(lookup, dict) else "")
@@ -412,11 +413,14 @@ class SyncEngine:
             != self.SYNC_ALGORITHM
         )
         if lookup and not retry_old_vidfast:
-            result = {"status": "ok", "cached": True, **(lookup.get("details") or lookup)}
+            cached_value = dict(lookup.get("details") or lookup)
+            cached_value.pop("_cache_source", None)
+            result = {"status": "ok", "cached": True, **cached_value}
             if reference_audio_url and not result.get("video_start_time"):
                 lookup = None
             else:
                 result["cache_key"] = cache_key
+                result["cache_source"] = lookup_source or "unknown"
                 return result
 
         video_entries, _ = await self._video_entries(video_url, video_headers)
@@ -510,6 +514,8 @@ class SyncEngine:
                         result["video_start_time"] = round(video_start_time, 3)
                     result["sync_algorithm"] = self.SYNC_ALGORITHM
                     result["cache_key"] = cache_key
+                    result["cached"] = False
+                    result["cache_source"] = None
                     return result
 
             # Phase 2: Fallback positions (5.0s each) if Fast Pass did not have low deviation
@@ -534,4 +540,6 @@ class SyncEngine:
             result["video_start_time"] = round(video_start_time, 3)
         result["sync_algorithm"] = self.SYNC_ALGORITHM
         result["cache_key"] = cache_key
+        result["cached"] = False
+        result["cache_source"] = None
         return result

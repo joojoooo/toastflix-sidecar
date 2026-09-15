@@ -5,3 +5,8 @@ services:
     plan: free
     image:
       url: ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
+    envVars:
+      - key: SIDECAR_ADMIN_TOKEN
+        generateValue: true
+      - key: SIDECAR_CACHE_DIR
+        value: /app/data
