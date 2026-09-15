@@ -93,6 +93,24 @@ def _audio_url(request: Request, hid: str, token: str, offset: float = 0.0, rate
     return f"{_base_url(request)}/dual/aud/{hid}/audio.m3u8?{query}"
 
 
+def _with_remote_fallback(payload: dict) -> dict:
+    """Reuse the latest playback's VPS destination when the current track omitted it."""
+    result = dict(payload)
+    fallback = playbacks.latest_remote_context()
+    current_host = result.get("vpsHost") or result.get("vps_host")
+    current_access = result.get("vpsAccess") or result.get("vps_access")
+    if ((not current_host or not current_access)
+            and fallback.get("vpsHost") and fallback.get("vpsAccess")):
+        result["vpsHost"] = fallback["vpsHost"]
+        result["vpsAccess"] = fallback["vpsAccess"]
+        return result
+    if not (result.get("vpsHost") or result.get("vps_host")) and fallback.get("vpsHost"):
+        result["vpsHost"] = fallback["vpsHost"]
+    if not (result.get("vpsAccess") or result.get("vps_access")) and fallback.get("vpsAccess"):
+        result["vpsAccess"] = fallback["vpsAccess"]
+    return result
+
+
 @app.get("/health")
 async def health():
     return {
@@ -273,7 +291,7 @@ async def audio_segment(hid: str, idx: int, request: Request, o: int = 0, r: int
 async def offset_lookup(request: Request):
     body = await request.json()
     token = _require_session(request, body)
-    result = await offsets.lookup(body)
+    result = await offsets.lookup(_with_remote_fallback(body))
     cache_source = result.get("_cache_source") if isinstance(result, dict) else None
     public_result = dict(result) if isinstance(result, dict) else result
     if isinstance(public_result, dict):
@@ -304,7 +322,8 @@ async def offset_report(request: Request):
     if not isinstance(result, dict):
         raise HTTPException(status_code=400, detail="offset result required")
     report_status = await offsets.report(
-        body, result, upload_remote=offsets.automatic_upload_enabled
+        _with_remote_fallback(body), result,
+        upload_remote=offsets.automatic_upload_enabled,
     )
     hid = str(body.get("audio_hid") or body.get("hid") or "")
     if hid:
@@ -316,9 +335,12 @@ async def offset_report(request: Request):
 async def sync_audio(request: Request):
     body = await request.json()
     token = _require_session(request, body)
+    sync_payload = _with_remote_fallback(body)
     try:
-        result = await sync_engine.measure(body)
+        result = await sync_engine.measure(sync_payload)
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        if sync_payload.get("cache_key"):
+            body["cache_key"] = sync_payload["cache_key"]
         hid = str(body.get("audio_hid") or "")
         if hid:
             playbacks.bind(hid, token, body, {
@@ -328,8 +350,10 @@ async def sync_audio(request: Request):
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             })
         raise HTTPException(status_code=422, detail=str(exc))
+    if sync_payload.get("cache_key"):
+        body["cache_key"] = sync_payload["cache_key"]
     report_status = await offsets.report(
-        body, result, upload_remote=offsets.automatic_upload_enabled
+        sync_payload, result, upload_remote=offsets.automatic_upload_enabled
     )
     result["storage"] = report_status
     hid = str(body.get("audio_hid") or "")
@@ -362,6 +386,7 @@ async def _dashboard_snapshot(include_activity: bool = True, include_tracks: boo
                     inspected[hid] = {"hid": hid, "error": f"{type(exc).__name__}: {exc}"}
             player["audio_track"] = inspected[hid]
     offset_records = await offsets.list() if include_offsets else None
+    fallback_context = playbacks.latest_remote_context()
     dynamic_hosts = sorted({
         str(
             (player.get("sync_metadata") or {}).get("vpsHost")
@@ -394,6 +419,8 @@ async def _dashboard_snapshot(include_activity: bool = True, include_tracks: boo
             "remote_db_configured": bool(OFFSET_API_URL),
             "configured_offset_api_url": OFFSET_API_URL or None,
             "dynamic_vps_hosts": dynamic_hosts,
+            "fallback_vps_host": fallback_context.get("vpsHost") or None,
+            "fallback_vps_access_available": bool(fallback_context.get("vpsAccess")),
             "automatic_remote_upload_enabled": offsets.automatic_upload_enabled,
             "audio_proxy_configured": bool(AUDIO_PROXY),
             "session_ttl_seconds": SESSION_TTL,

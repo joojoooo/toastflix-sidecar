@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from playback import PlaybackRegistry, safe_metadata
+from playback import PLAYBACK_ACTIVE_GRACE_SECONDS, PlaybackRegistry, safe_metadata
 
 
 class PlaybackRegistryTests(unittest.TestCase):
@@ -99,6 +100,40 @@ class PlaybackRegistryTests(unittest.TestCase):
             "server": "",
             "title": "",
         })
+
+    def test_upload_context_falls_back_to_a_previous_track(self):
+        registry = PlaybackRegistry()
+        registry.register(
+            "c" * 16,
+            self.token,
+            {"media_key": "movie:first", "language": "eng"},
+            request_metadata={
+                "vpsHost": "https://previous.example.test",
+                "vpsAccess": "previous-access",
+            },
+        )
+        registry.register(
+            "d" * 16,
+            self.token,
+            {"media_key": "movie:second", "language": "ita"},
+            request_metadata={"vpsHost": "https://incomplete.example.test"},
+        )
+        registry.bind("d" * 16, self.token, {"cache_key": "new-cache"}, {})
+
+        context = registry.context_for_cache("new-cache")
+
+        self.assertEqual(context["vpsHost"], "https://previous.example.test")
+        self.assertEqual(context["vpsAccess"], "previous-access")
+
+    def test_playback_remains_active_during_pause_grace_period(self):
+        player = self.registry._players[self.playback_id]
+        player["last_request_at"] = 1_000.0
+
+        with patch("playback.time.time", return_value=1_000.0 + PLAYBACK_ACTIVE_GRACE_SECONDS - 1):
+            self.assertTrue(self.registry.get(self.playback_id)["active"])
+
+        with patch("playback.time.time", return_value=1_000.0 + PLAYBACK_ACTIVE_GRACE_SECONDS):
+            self.assertFalse(self.registry.get(self.playback_id)["active"])
 
 
 if __name__ == "__main__":

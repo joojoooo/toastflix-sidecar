@@ -68,26 +68,34 @@
       <section class="section" id="now-section">
         <div class="section-heading">
           <div><span class="section-number">01</span><h2>Now playing</h2></div>
-          <p>One card per media session. Italian, English, or other prepared tracks are labelled inside the card instead of appearing as anonymous duplicate playbacks.</p>
+          <div class="section-heading-actions">
+            <p>One card per media session. Italian, English, or other prepared tracks are labelled inside the card instead of appearing as anonymous duplicate playbacks.</p>
+            <button class="button subtle section-toggle" type="button" data-section-toggle="now-content" data-title="now playing">Hide section</button>
+          </div>
         </div>
-        <div id="sessions" class="session-list"></div>
-        <div id="no-sessions" class="empty panel">Waiting for ToastFlix to prepare an audio track…</div>
+        <div id="now-content">
+          <div id="sessions" class="session-list"></div>
+          <div id="no-sessions" class="empty panel">Waiting for ToastFlix to prepare an audio track…</div>
+        </div>
       </section>
 
       <section id="history-section" class="section" hidden>
         <div class="section-heading slim">
           <div><span class="section-number">02</span><h2>Previous playback</h2></div>
-          <button id="history-toggle" class="button subtle" type="button">Show history</button>
+          <button id="history-toggle" class="button subtle section-toggle" type="button" data-section-toggle="history" data-title="history">Show history</button>
         </div>
         <div id="history" class="session-list history" hidden></div>
       </section>
 
-      <section class="section">
+      <section class="section" id="offsets-section">
         <div class="section-heading">
           <div><span class="section-number">03</span><h2>Offset records</h2></div>
-          <p>Every local record, its original automatic value, edit history, and its available upload destination.</p>
+          <div class="section-heading-actions">
+            <p>Every local record, its original automatic value, edit history, and its available upload destination.</p>
+            <button class="button subtle section-toggle" type="button" data-section-toggle="offsets-content" data-title="offset records">Hide section</button>
+          </div>
         </div>
-        <div class="table-panel panel">
+        <div id="offsets-content" class="table-panel panel">
           <table class="offset-table">
             <thead><tr><th>Media / cache key</th><th>Resolution</th><th>Current offset</th><th>Rate</th><th>Provenance</th><th>Actions</th></tr></thead>
             <tbody id="offset-rows"></tbody>
@@ -96,12 +104,15 @@
         </div>
       </section>
 
-      <section class="section">
+      <section class="section" id="decisions-section">
         <div class="section-heading">
           <div><span class="section-number">04</span><h2>Sidecar decisions</h2></div>
-          <p>Internal playback state changes: preparation, cache decisions, measurements, player requests, manual edits, restores, and remote uploads.</p>
+          <div class="section-heading-actions">
+            <p>Internal playback state changes: preparation, cache decisions, measurements, player requests, manual edits, restores, and remote uploads.</p>
+            <button class="button subtle section-toggle" type="button" data-section-toggle="decisions-content" data-title="sidecar decisions">Hide section</button>
+          </div>
         </div>
-        <div class="table-panel panel">
+        <div id="decisions-content" class="table-panel panel decision-panel">
           <table class="decision-table">
             <thead><tr><th>Time</th><th>Event</th><th>Playback</th><th>Complete details</th><th></th></tr></thead>
             <tbody id="decision-rows"></tbody>
@@ -113,24 +124,29 @@
       <section class="section traffic-section">
         <div class="section-heading">
           <div><span class="section-number">05</span><h2>Traffic inspector</h2></div>
-          <p>Inbound calls and responses to Stremio, plus every outbound media and database request. Select a row for complete headers and bodies.</p>
-        </div>
-        <div class="traffic-tools">
-          <input id="traffic-search" type="search" placeholder="Filter URL, method, category, status…">
-          <div id="traffic-filters" class="segmented">
-            <button class="selected" data-filter="all" type="button">All</button>
-            <button data-filter="stremio" type="button">Stremio / player</button>
-            <button data-filter="media" type="button">Media downloads</button>
-            <button data-filter="database" type="button">VPS / database</button>
-            <button data-filter="dashboard" type="button">Dashboard</button>
+          <div class="section-heading-actions">
+            <p>Inbound calls and responses to Stremio, plus every outbound media and database request. Select a row for complete headers and bodies.</p>
+            <button class="button subtle section-toggle" type="button" data-section-toggle="traffic-content" data-title="traffic inspector">Hide section</button>
           </div>
         </div>
-        <div class="table-panel panel traffic-panel">
-          <table class="traffic-table">
-            <thead><tr><th>Time</th><th>Flow</th><th>Category</th><th>Method</th><th>URL</th><th>Status</th><th>Duration</th><th>Bytes</th></tr></thead>
-            <tbody id="traffic-rows"></tbody>
-          </table>
-          <div id="no-traffic" class="empty">No matching traffic.</div>
+        <div id="traffic-content">
+          <div class="traffic-tools">
+            <input id="traffic-search" type="search" placeholder="Filter URL, method, category, status…">
+            <div id="traffic-filters" class="segmented">
+              <button class="selected" data-filter="all" type="button">All</button>
+              <button data-filter="stremio" type="button">Stremio / player</button>
+              <button data-filter="media" type="button">Media downloads</button>
+              <button data-filter="database" type="button">VPS / database</button>
+              <button data-filter="dashboard" type="button">Dashboard</button>
+            </div>
+          </div>
+          <div class="table-panel panel traffic-panel">
+            <table class="traffic-table">
+              <thead><tr><th>Time</th><th>Flow</th><th>Category</th><th>Method</th><th>URL</th><th>Status</th><th>Duration</th><th>Bytes</th></tr></thead>
+              <tbody id="traffic-rows"></tbody>
+            </table>
+            <div id="no-traffic" class="empty">No matching traffic.</div>
+          </div>
         </div>
       </section>
 

@@ -4,6 +4,9 @@ import time
 from collections import deque
 
 
+PLAYBACK_ACTIVE_GRACE_SECONDS = 5 * 60
+
+
 def safe_metadata(value, key: str = ""):
     """Make captured metadata JSON-compatible without removing any fields."""
     if isinstance(value, dict):
@@ -276,12 +279,25 @@ class PlaybackRegistry:
 
     def context_for_cache(self, cache_key: str) -> dict:
         matches = [player for player in self._players.values() if player.get("cache_key") == cache_key]
-        if not matches:
+        latest = max(matches, key=lambda player: player.get("updated_at") or 0) if matches else None
+        context = self._context_from_player(latest) if latest else {}
+        fallback = self.latest_remote_context()
+        if ((not context.get("vpsHost") or not context.get("vpsAccess"))
+                and fallback.get("vpsHost") and fallback.get("vpsAccess")):
+            context["vpsHost"] = fallback["vpsHost"]
+            context["vpsAccess"] = fallback["vpsAccess"]
+        for key, value in fallback.items():
+            if not context.get(key) and value:
+                context[key] = value
+        return context
+
+    @staticmethod
+    def _context_from_player(player: dict | None) -> dict:
+        if not player:
             return {}
-        latest = max(matches, key=lambda player: player.get("updated_at") or 0)
         metadata = {
-            **(latest.get("prepare_request") or {}),
-            **(latest.get("sync_metadata") or {}),
+            **(player.get("prepare_request") or {}),
+            **(player.get("sync_metadata") or {}),
         }
         return {
             "vpsHost": metadata.get("vpsHost") or metadata.get("vps_host") or "",
@@ -290,6 +306,27 @@ class PlaybackRegistry:
             "server": metadata.get("server") or "",
             "title": metadata.get("title") or "",
         }
+
+    def latest_remote_context(self) -> dict:
+        """Return the newest reusable VPS context, filling gaps from older tracks."""
+        players = sorted(
+            self._players.values(),
+            key=lambda player: player.get("updated_at") or 0,
+            reverse=True,
+        )
+        candidates = [self._context_from_player(player) for player in players]
+        complete = next(
+            (item for item in candidates if item.get("vpsHost") and item.get("vpsAccess")),
+            None,
+        )
+        if complete:
+            return complete
+        context = {}
+        for candidate in candidates:
+            for key, value in candidate.items():
+                if not context.get(key) and value:
+                    context[key] = value
+        return context
 
     def restore_for_cache(self, cache_key: str) -> int:
         restored = 0
@@ -308,9 +345,12 @@ class PlaybackRegistry:
         result = {key: value for key, value in player.items() if key != "token_hash"}
         result["pending_player_request"] = player["revision"] > player["applied_revision"]
         last_request = player.get("last_request_at") or 0
-        recently_updated = time.time() - (player.get("updated_at") or 0) < 120
+        recently_updated = (
+            time.time() - (player.get("updated_at") or 0) < PLAYBACK_ACTIVE_GRACE_SECONDS
+        )
         result["active"] = not player.get("ended_at") and (
-            time.time() - last_request < 120 if last_request else recently_updated
+            time.time() - last_request < PLAYBACK_ACTIVE_GRACE_SECONDS
+            if last_request else recently_updated
         )
         return result
 

@@ -11,7 +11,7 @@ const ui = {
   serverMeta: document.querySelector("#server-meta"),
   sessions: document.querySelector("#sessions"), noSessions: document.querySelector("#no-sessions"),
   historySection: document.querySelector("#history-section"), history: document.querySelector("#history"),
-  historyToggle: document.querySelector("#history-toggle"), offsets: document.querySelector("#offset-rows"),
+  offsets: document.querySelector("#offset-rows"),
   noOffsets: document.querySelector("#no-offsets"), decisions: document.querySelector("#decision-rows"),
   noDecisions: document.querySelector("#no-decisions"), traffic: document.querySelector("#traffic-rows"),
   noTraffic: document.querySelector("#no-traffic"), trafficSearch: document.querySelector("#traffic-search"),
@@ -157,8 +157,6 @@ function mediaTitle(mediaKey) {
   return heading;
 }
 
-function pill(text, style = "") { return element("span", `status-pill ${style}`.trim(), text); }
-
 function languageInfo(value) {
   const code = String(value || "unknown").toLowerCase();
   if (["ita", "it", "italian"].includes(code)) return { code: "ITA", name: "Italian audio track" };
@@ -270,7 +268,7 @@ function numericField(label, value, step, className) {
   return { wrapper, input };
 }
 
-function drawWaveform(canvas, buffers, seconds, shiftSeconds = 0) {
+function drawWaveform(canvas, buffers, seconds, shiftSeconds = 0, cursorSeconds = null) {
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(500, canvas.clientWidth * ratio);
   const height = Math.max(100, canvas.clientHeight * ratio);
@@ -302,6 +300,16 @@ function drawWaveform(canvas, buffers, seconds, shiftSeconds = 0) {
   };
   render(buffers.reference, "#8db6ff", 0);
   render(buffers.replacement, "#ff5b21", shiftSeconds);
+  if (Number.isFinite(cursorSeconds)) {
+    const cursorX = Math.max(0, Math.min(width, (cursorSeconds / seconds) * width));
+    context.strokeStyle = "#f2efe8"; context.lineWidth = 1.5 * ratio;
+    context.beginPath(); context.moveTo(cursorX, 0); context.lineTo(cursorX, height); context.stroke();
+    context.fillStyle = "#f2efe8"; context.beginPath();
+    context.moveTo(cursorX - 7 * ratio, 0);
+    context.lineTo(cursorX + 7 * ratio, 0);
+    context.lineTo(cursorX, 9 * ratio);
+    context.closePath(); context.fill();
+  }
 }
 
 function rawBlock(title, value) {
@@ -315,16 +323,39 @@ function rawBlock(title, value) {
 }
 
 function createAlignmentLab(player, offsetInput) {
-  const lab = element("div", "alignment");
+  const lab = element("div", "tab-panel alignment");
   lab.append(element("h4", "", "Manual alignment lab"));
-  const note = element("p", "alignment-note", "Generate the player/reference audio and the replacement track at the same timeline position. Blue is the reference; orange is the replacement shifted by the offset field above.");
+  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. Use the offset slider to move the orange waveform.");
   const controls = element("div", "alignment-controls");
   const defaultPosition = player.sync_result?.measurements?.[0]?.position || 60;
   const position = numericField("Timeline position · seconds", Number(defaultPosition).toFixed(3), "0.001", "");
   const seconds = numericField("Sample length · seconds", "8", "1", "");
+  position.input.min = "0"; seconds.input.min = "1"; seconds.input.max = "30";
   const load = element("button", "button primary", "Load both waveforms");
   controls.append(position.wrapper, seconds.wrapper, load);
-  const canvas = element("canvas");
+  const offsetSlider = element("div", "offset-slider-control");
+  const sliderLabel = element("label");
+  const sliderValue = element("strong", "", `${formatOffset(offsetInput.value)} s`);
+  sliderLabel.append("Visual offset", sliderValue);
+  const slider = element("input");
+  slider.type = "range"; slider.step = "0.001";
+  const setSliderBounds = () => {
+    const value = Number(offsetInput.value) || 0;
+    slider.min = String(Math.min(-5, Math.floor(value) - 1));
+    slider.max = String(Math.max(5, Math.ceil(value) + 1));
+    slider.value = String(value);
+    sliderValue.textContent = `${formatOffset(value)} s`;
+  };
+  setSliderBounds();
+  offsetSlider.append(sliderLabel, slider);
+  const canvas = element("canvas", "alignment-waveform");
+  canvas.tabIndex = 0;
+  canvas.setAttribute("role", "slider");
+  canvas.setAttribute("aria-label", "Waveform playback cursor");
+  canvas.setAttribute("aria-valuemin", "0");
+  canvas.setAttribute("aria-valuemax", seconds.input.value);
+  canvas.setAttribute("aria-valuenow", "0");
+  canvas.title = "Tap or drag to seek both previews";
   const audioGrid = element("div", "alignment-audio");
   const referenceWrap = element("div"); referenceWrap.append(element("label", "", "Reference / player audio"));
   const replacementWrap = element("div"); replacementWrap.append(element("label", "", "Replacement audio track"));
@@ -334,6 +365,58 @@ function createAlignmentLab(player, offsetInput) {
   audioGrid.append(referenceWrap, replacementWrap);
   const status = element("p", "alignment-note", "No comparison loaded yet.");
   const buffers = { reference: null, replacement: null };
+  let cursorTime = 0;
+  let animationFrame = null;
+  const sampleSeconds = () => Math.max(0.001, Number(seconds.input.value) || 8);
+  const redraw = () => {
+    if (buffers.reference || buffers.replacement) {
+      drawWaveform(canvas, buffers, sampleSeconds(), Number(offsetInput.value), cursorTime);
+    }
+    canvas.setAttribute("aria-valuemax", String(sampleSeconds()));
+    canvas.setAttribute("aria-valuenow", String(cursorTime.toFixed(3)));
+  };
+  const seek = (value) => {
+    cursorTime = Math.max(0, Math.min(sampleSeconds(), Number(value) || 0));
+    [referenceAudio, replacementAudio].forEach((audio) => {
+      try { audio.currentTime = Math.min(cursorTime, Number.isFinite(audio.duration) ? audio.duration : cursorTime); }
+      catch (_) { /* Media metadata may still be loading. */ }
+    });
+    redraw();
+  };
+  const animateCursor = () => {
+    cancelAnimationFrame(animationFrame);
+    const tick = () => {
+      const activeAudio = !referenceAudio.paused ? referenceAudio : !replacementAudio.paused ? replacementAudio : null;
+      if (!activeAudio) { redraw(); return; }
+      cursorTime = activeAudio.currentTime;
+      redraw();
+      animationFrame = requestAnimationFrame(tick);
+    };
+    animationFrame = requestAnimationFrame(tick);
+  };
+  const seekFromPointer = (event) => {
+    const bounds = canvas.getBoundingClientRect();
+    seek(((event.clientX - bounds.left) / bounds.width) * sampleSeconds());
+  };
+  canvas.addEventListener("pointerdown", (event) => {
+    canvas.setPointerCapture(event.pointerId); seekFromPointer(event);
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (canvas.hasPointerCapture(event.pointerId)) seekFromPointer(event);
+  });
+  canvas.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "Home") seek(0);
+    else if (event.key === "End") seek(sampleSeconds());
+    else seek(cursorTime + (event.key === "ArrowRight" ? 0.1 : -0.1));
+  });
+  [referenceAudio, replacementAudio].forEach((audio) => {
+    audio.addEventListener("play", animateCursor);
+    audio.addEventListener("seeking", () => { cursorTime = audio.currentTime; redraw(); });
+    audio.addEventListener("loadedmetadata", () => seek(cursorTime));
+    audio.addEventListener("ended", redraw);
+  });
   load.addEventListener("click", async () => {
     load.disabled = true; status.textContent = "Downloading and decoding both samples…";
     const query = new URLSearchParams({ position: position.input.value, seconds: seconds.input.value });
@@ -344,31 +427,34 @@ function createAlignmentLab(player, offsetInput) {
       ]);
       referenceAudio.src = reference.url; replacementAudio.src = replacement.url;
       buffers.reference = reference.decoded; buffers.replacement = replacement.decoded;
-      drawWaveform(canvas, buffers, Number(seconds.input.value), Number(offsetInput.value));
-      status.textContent = "Loaded. Adjust the offset field to slide the orange waveform over the blue reference.";
+      seek(0);
+      status.textContent = "Loaded. Drag the cursor to seek, then slide the orange waveform until the events align.";
     } catch (error) { status.textContent = error.message; showNotice(error.message, true); }
     finally { load.disabled = false; }
   });
   offsetInput.addEventListener("input", () => {
-    if (buffers.reference || buffers.replacement) {
-      drawWaveform(canvas, buffers, Number(seconds.input.value), Number(offsetInput.value));
-    }
+    setSliderBounds(); redraw();
   });
-  lab.append(note, controls, canvas, audioGrid, status);
+  slider.addEventListener("input", () => {
+    offsetInput.value = Number(slider.value).toFixed(3);
+    offsetInput.dispatchEvent(new Event("input"));
+  });
+  seconds.input.addEventListener("input", redraw);
+  lab.append(note, controls, offsetSlider, canvas, audioGrid, status);
   return lab;
 }
 
-function createAudioPanel(player, offsetInput) {
+function createAudioPanel(player) {
   const panel = element("div", "tab-panel");
+  const layout = element("div", "audio-preview-grid");
   const stage = element("div", "preview-stage");
-  stage.append(element("strong", "", "Downloaded audio segment preview"), element("p", "alignment-note", "Choose any source segment below. The sidecar downloads, decrypts, and converts it to WAV for browser playback and waveform inspection."));
+  stage.append(element("strong", "", "Downloaded audio segment preview"), element("p", "alignment-note", "Choose one of the two latest source segments to download, decrypt, and preview as WAV."));
   const audio = element("audio"); audio.controls = true;
-  const canvas = element("canvas");
   const stageStatus = element("p", "alignment-note", "No segment loaded.");
-  stage.append(audio, canvas, stageStatus);
+  stage.append(audio, stageStatus);
   const list = element("div", "segment-list");
   const segments = player.audio_track?.segments || [];
-  segments.forEach((segment) => {
+  segments.slice(-2).forEach((segment) => {
     const row = element("div", "segment");
     row.append(
       element("span", "", `#${segment.index}`),
@@ -384,7 +470,6 @@ function createAudioPanel(player, offsetInput) {
       try {
         const preview = await fetchAudio(`/api/dashboard/audio/${player.hid}/segments/${segment.index}/preview.wav`);
         audio.src = preview.url;
-        drawWaveform(canvas, { replacement: preview.decoded }, preview.decoded.duration, 0);
         stageStatus.textContent = `Segment #${segment.index} · ${preview.decoded.duration.toFixed(3)} seconds · ${preview.decoded.sampleRate} Hz`;
         audio.play().catch(() => {});
       } catch (error) { stageStatus.textContent = error.message; showNotice(error.message, true); }
@@ -393,7 +478,8 @@ function createAudioPanel(player, offsetInput) {
     row.append(link, play); list.append(row);
   });
   if (!segments.length) list.append(element("div", "empty", "No audio segment metadata is available."));
-  panel.append(stage, list, createAlignmentLab(player, offsetInput));
+  layout.append(stage, list); panel.append(layout);
+  requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
   return panel;
 }
 
@@ -411,6 +497,26 @@ function createNetworkPanel(player) {
     ["Audio headers", jsonText(audioMeta.headers || metadataValue(player, "audio_headers", "audioHeaders") || {}), false],
     ["Video headers", jsonText(metadataValue(player, "video_headers", "videoHeaders") || {}), false],
   ].forEach(([label, value, link]) => { if (value !== undefined && value !== "") fields.append(makeField(label, value, link)); });
+  panel.append(fields);
+  return panel;
+}
+
+function createDetailsPanel(player, lang, source, registration) {
+  const panel = element("div", "tab-panel");
+  const fields = element("div", "data-grid");
+  [
+    ["Track language", lang.name, false], ["Offset provenance", source.label, false],
+    ["Database lookup", databaseLookupInfo(player), false],
+    ["Audio playlist setup", registration, false],
+    ["Last HLS request type", player.last_request_kind || "None yet", false],
+    ["Last offset received in an HLS request", player.request_count ? `${formatOffset(player.last_requested_offset)} s` : "No HLS request received yet", false],
+    ["Cache key", player.cache_key, false],
+    ["Video fingerprint", metadataValue(player, "video_fingerprint", "videoFingerprint"), false],
+    ["Audio fingerprint", metadataValue(player, "audio_fingerprint", "audioFingerprint", "source_fingerprint"), false],
+    ["Resolution", player.resolution ? `${player.resolution}p` : null, false],
+  ].forEach(([label, value, link]) => {
+    if (value !== null && value !== undefined && value !== "") fields.append(makeField(label, value, link));
+  });
   panel.append(fields);
   return panel;
 }
@@ -442,15 +548,18 @@ function createTrack(player) {
   const requestState = player.request_count > 0
     ? (player.active ? { text: "player stream active", style: "live" } : { text: "no recent player requests", style: "" })
     : (player.ended_at ? { text: "playback ended before streaming", style: "" } : { text: "prepared · waiting for player", style: "" });
-  head.append(language, pill(requestState.text, requestState.style));
+  head.append(language, element("span", `track-state ${requestState.style}`.trim(), requestState.text));
 
   const source = sourceInfo(player);
   const offsetHero = element("div", "offset-hero");
-  const description = element("div");
-  description.append(element("span", "", "Effective audio offset"), element("p", "", source.detail), pill(source.label, source.style));
+  const offsetValue = element("div", "offset-value");
+  offsetValue.append(element("span", "", "Effective audio offset"));
   const offsetNumber = element("div", "offset-number", formatOffset(player.current_offset));
   offsetNumber.append(element("small", "", " s"));
-  offsetHero.append(description, offsetNumber);
+  offsetValue.append(offsetNumber);
+  const description = element("div");
+  description.append(element("strong", `offset-source ${source.style}`.trim(), source.label), element("p", "", source.detail));
+  offsetHero.append(offsetValue, description);
 
   const candidates = element("div", "candidate-list");
   const requestCandidateOffset = Number(player.offset_candidates?.request?.offset ?? 0);
@@ -459,12 +568,16 @@ function createTrack(player) {
     : "Offset carried by incoming HLS URL";
   const candidateNames = { request: requestCandidateName, cached: "Cached database value", calculated: "Sidecar calculated value", manual: "Manual value" };
   Object.entries(player.offset_candidates || {}).forEach(([name, candidate]) => {
-    const row = element("div", "candidate");
+    const selected = name === player.control_source;
+    const row = element("button", `candidate ${selected ? "selected" : ""}`.trim());
+    row.type = "button"; row.setAttribute("aria-pressed", String(selected));
+    row.title = selected ? "This offset is currently in use" : `Use ${candidateNames[name] || name}`;
     row.append(
-      element("span", "", `${candidateNames[name] || name} · ${candidate.source || ""}`),
+      element("span", "candidate-label", `${candidateNames[name] || name} · ${candidate.source || ""}`),
       element("strong", "", `${formatOffset(candidate.offset)} s`),
-      pill(name === player.control_source ? "currently used" : "available", name === player.control_source ? source.style : ""),
     );
+    if (selected) row.append(element("span", "candidate-current", "In use"));
+    else if (name !== "manual") row.addEventListener("click", () => restorePlayer(player.playback_id, name));
     candidates.append(row);
   });
 
@@ -473,7 +586,7 @@ function createTrack(player) {
   const rate = numericField("Playback rate", Number(player.current_rate).toFixed(9), "0.000001", "rate-input");
   controls.append(offset.wrapper, rate.wrapper);
   const nudges = element("div", "nudge-row");
-  [-0.5, -0.1, -0.01, 0.01, 0.1, 0.5].forEach((amount) => {
+  [-1, -0.5, -0.1, -0.01, 0.01, 0.1, 0.5, 1].forEach((amount) => {
     const button = element("button", "button", `${amount > 0 ? "+" : ""}${amount}s`);
     button.type = "button";
     button.addEventListener("click", () => { offset.input.value = (Number(offset.input.value) + amount).toFixed(3); offset.input.dispatchEvent(new Event("input")); });
@@ -482,62 +595,35 @@ function createTrack(player) {
   const actions = element("div", "action-row");
   const save = element("button", "button primary", "Apply manual offset");
   save.type = "button"; save.addEventListener("click", () => editPlayer(player.playback_id, offset.input.value, rate.input.value));
-  const automaticLabels = {
-    cached: "DB cache", calculated: "sidecar calculation", request: "incoming HLS value",
-  };
-  const restoreButtons = ["cached", "calculated", "request"].flatMap((name) => {
-    const candidate = player.offset_candidates?.[name];
-    if (!candidate) return [];
-    const button = element(
-      "button", "button subtle", `Use ${automaticLabels[name]} ${formatOffset(candidate.offset)}s`
-    );
-    button.type = "button"; button.disabled = player.control_source === name;
-    button.addEventListener("click", () => restorePlayer(player.playback_id, name));
-    return [button];
-  });
-  if (!restoreButtons.length) {
-    const unavailable = element("button", "button subtle", "No automatic value");
-    unavailable.type = "button"; unavailable.disabled = true; restoreButtons.push(unavailable);
-  }
   const upload = element(
     "button", "button subtle", `Upload selected ${formatOffset(player.current_offset)}s`
   );
+  const fallbackHost = currentState?.server?.fallback_vps_host;
+  const currentHost = metadataValue(player, "vpsHost", "vps_host");
   const hasDestination = Boolean(
-    currentState?.server?.remote_db_configured || metadataValue(player, "vpsHost", "vps_host")
+    currentState?.server?.remote_db_configured || currentHost || fallbackHost
   );
   upload.type = "button"; upload.disabled = !player.cache_key || !hasDestination;
   upload.title = hasDestination
-    ? `Upload the currently used ${player.control_source} value using OFFSET_API_URL or this playback's vpsHost`
-    : "No OFFSET_API_URL or playback vpsHost is available";
+    ? `Upload the currently used ${player.control_source} value using ${currentState?.server?.remote_db_configured ? "the configured OFFSET_API_URL" : currentHost ? "this playback's vpsHost" : "the previous playback's vpsHost"}`
+    : "No OFFSET_API_URL or current/previous playback vpsHost is available";
   upload.addEventListener("click", () => uploadOffset(player.cache_key, player.playback_id));
-  actions.append(save, ...restoreButtons, upload);
+  actions.append(save, upload);
   const applyState = element("p", `apply-state ${player.pending_player_request ? "pending" : ""}`,
     player.pending_player_request
       ? "Waiting for the next HLS request to use this revision."
       : `Applied revision ${player.revision} · last ${player.last_request_kind || "request"} ${formatTime(player.last_request_at)} · ${player.request_count} total requests.`);
 
-  const dataGrid = element("div", "data-grid");
-  [
-    ["Track language", lang.name, false], ["Offset provenance", source.label, false],
-    ["Database lookup", databaseLookupInfo(player), false],
-    ["Audio playlist setup", registration, false],
-    ["Last HLS request type", player.last_request_kind || "None yet", false],
-    ["Last offset received in an HLS request", player.request_count ? `${formatOffset(player.last_requested_offset)} s` : "No HLS request received yet", false],
-    ["Video URL", metadataValue(player, "video_url", "videoUrl", "videoURL", "stream_url", "streamUrl"), true],
-    ["VPS host", metadataValue(player, "vpsHost", "vps_host"), true], ["Cache key", player.cache_key, false],
-    ["Video fingerprint", metadataValue(player, "video_fingerprint", "videoFingerprint"), false],
-    ["Audio fingerprint", metadataValue(player, "audio_fingerprint", "audioFingerprint", "source_fingerprint"), false],
-    ["Resolution", player.resolution ? `${player.resolution}p` : null, false],
-  ].forEach(([label, value, link]) => { if (value !== null && value !== undefined && value !== "") dataGrid.append(makeField(label, value, link)); });
-
   const tabs = element("div", "tabs");
   const panels = {
-    audio: createAudioPanel(player, offset.input),
+    details: createDetailsPanel(player, lang, source, registration),
+    audio: createAudioPanel(player),
+    alignment: createAlignmentLab(player, offset.input),
     network: createNetworkPanel(player),
     raw: createRawPanel(player),
   };
-  const selected = selectedTabs.get(player.playback_id) || "audio";
-  Object.entries({ audio: "Audio & waveforms", network: "Links & credentials", raw: "Complete metadata" }).forEach(([key, label]) => {
+  const selected = selectedTabs.get(player.playback_id) || "details";
+  Object.entries({ details: "Overview", audio: "Audio preview", alignment: "Alignment lab", network: "Links & credentials", raw: "Complete metadata" }).forEach(([key, label]) => {
     const button = element("button", `tab-button ${selected === key ? "selected" : ""}`, label);
     button.type = "button"; button.dataset.tab = key;
     button.addEventListener("click", () => {
@@ -548,7 +634,7 @@ function createTrack(player) {
     tabs.append(button);
   });
   Object.entries(panels).forEach(([key, panel]) => { panel.hidden = key !== selected; });
-  track.append(head, offsetHero, candidates, controls, nudges, actions, applyState, dataGrid, tabs, ...Object.values(panels));
+  track.append(head, offsetHero, candidates, controls, nudges, actions, applyState, tabs, ...Object.values(panels));
   return track;
 }
 
@@ -570,14 +656,14 @@ function createSession(group, isHistory = false) {
   const title = element("div", "session-title");
   title.append(element("span", "", `${isHistory ? "Previous" : "Current"} media · session ${group.sessionId}`), mediaTitle(group.mediaKey));
   const summary = element("div", "session-summary");
-  summary.append(
-    pill(group.tracks.some((track) => track.request_count > 0 && track.active)
-      ? "player stream active" : group.active ? "prepared media session" : "playback ended",
-    group.tracks.some((track) => track.request_count > 0 && track.active) ? "live" : ""),
-    pill(`${group.tracks.length} audio track${group.tracks.length === 1 ? "" : "s"}`),
-  );
+  const streamActive = group.tracks.some((track) => track.request_count > 0 && track.active);
+  summary.append(element(
+    "span", `session-state ${streamActive ? "live" : ""}`.trim(),
+    streamActive ? "Player stream active" : group.active ? "Prepared media session" : "Playback ended",
+  ));
+  summary.append(element("span", "session-meta", `${group.tracks.length} audio track${group.tracks.length === 1 ? "" : "s"}`));
   const resolutions = [...new Set(group.tracks.map((track) => track.resolution).filter(Boolean))];
-  if (resolutions.length) summary.append(pill(resolutions.map((item) => `${item}p`).join(" / ")));
+  if (resolutions.length) summary.append(element("span", "session-meta", resolutions.map((item) => `${item}p`).join(" / ")));
   header.append(title, summary);
   const tracks = element("div", "tracks");
   group.tracks.sort((a, b) => String(a.audio_metadata?.language).localeCompare(String(b.audio_metadata?.language))).forEach((track) => tracks.append(createTrack(track)));
@@ -863,6 +949,28 @@ function showLogin(message = "") {
   ui.loginError.textContent = message; setConnected(false, "Locked");
 }
 
+function initializeSectionToggles() {
+  document.querySelectorAll("[data-section-toggle]").forEach((button) => {
+    const target = document.getElementById(button.dataset.sectionToggle);
+    if (!target) return;
+    const storageKey = `sidecar-section-${target.id}`;
+    const saved = sessionStorage.getItem(storageKey);
+    if (saved !== null) target.hidden = saved === "hidden";
+    const update = () => {
+      const title = button.dataset.title || "section";
+      button.textContent = `${target.hidden ? "Show" : "Hide"} ${title}`;
+      button.setAttribute("aria-expanded", String(!target.hidden));
+      button.setAttribute("aria-controls", target.id);
+    };
+    button.addEventListener("click", () => {
+      target.hidden = !target.hidden;
+      sessionStorage.setItem(storageKey, target.hidden ? "hidden" : "shown");
+      update();
+    });
+    update();
+  });
+}
+
 async function connectStream() {
   clearTimeout(reconnectTimer);
   if (streamController) streamController.abort();
@@ -916,10 +1024,6 @@ ui.lock.addEventListener("click", () => {
   if (streamController) streamController.abort(); clearTimeout(reconnectTimer);
   token = ""; sessionStorage.removeItem("sidecar-admin-token"); ui.token.value = ""; showLogin();
 });
-ui.historyToggle.addEventListener("click", () => {
-  ui.history.hidden = !ui.history.hidden;
-  ui.historyToggle.textContent = ui.history.hidden ? "Show history" : "Hide history";
-});
 ui.trafficSearch.addEventListener("input", renderTraffic);
 ui.autoUpload.addEventListener("change", () => setAutomaticUpload(ui.autoUpload.checked));
 ui.trafficFilters.addEventListener("click", (event) => {
@@ -933,4 +1037,5 @@ ui.copyTransaction.addEventListener("click", () => { if (openTransaction) copyTe
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDrawer(); });
 window.addEventListener("beforeunload", () => { objectUrls.forEach((url) => URL.revokeObjectURL(url)); });
 
+initializeSectionToggles();
 if (token) connectStream();
