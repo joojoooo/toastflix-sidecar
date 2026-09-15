@@ -270,7 +270,7 @@ La console permette di:
 - correggere offset e rate con precisione millisecondo;
 - vedere quando la nuova revisione viene usata da una richiesta HLS;
 - scegliere di nuovo, dopo una modifica manuale, il valore cache DB, quello
-  calcolato dal sidecar o quello ricevuto nell'URL del player;
+  calcolato dal sidecar o quello trasportato nell'URL HLS richiesto da Stremio;
 - modificare record non piu' attivi nella libreria locale;
 - caricare esplicitamente un record modificato nel DB remoto;
 - ispezionare ogni chiamata HTTP in ingresso e relativa risposta, oltre alle

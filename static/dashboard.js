@@ -179,6 +179,17 @@ function metadataValue(player, ...names) {
   return undefined;
 }
 
+function incomingOffsetExplanation(player, offset) {
+  const value = `${formatOffset(offset)} s`;
+  if (["init", "segment"].includes(player.last_request_kind)) {
+    return `The sidecar wrote ${value} into this ${player.last_request_kind} URL when it generated the audio playlist.`;
+  }
+  if (player.last_request_kind === "playlist") {
+    return `The top-level audio playlist request arrived with ${value}. This sidecar initially emits that URL with +0.000 s, so a non-zero value came from upstream ToastFlix or a previously cached URL.`;
+  }
+  return `The incoming HLS URL contained ${value}. Inspect the HLS traffic entries to trace where the URL was produced.`;
+}
+
 function sourceInfo(player) {
   if (player.control_source === "manual") return {
     label: "Manual dashboard override", detail: "Your edited value currently takes priority.", style: "manual",
@@ -190,9 +201,43 @@ function sourceInfo(player) {
   if (player.control_source === "calculated") return {
     label: "Calculated by this sidecar", detail: "The sync engine measured this offset from media samples.", style: "calculated",
   };
-  return {
-    label: "Offset from player URL", detail: "No successful cache lookup or sidecar calculation is bound yet.", style: "",
+  const syncStatus = String(player.sync_result?.status || "").toLowerCase();
+  const carriedOffset = Number(player.offset_candidates?.request?.offset ?? player.current_offset ?? 0);
+  const isZeroFallback = Math.abs(carriedOffset) < 0.0005;
+  if (syncStatus === "incompatible") return {
+    label: isZeroFallback ? "Zero fallback retained after failed sync" : "Existing stream offset retained after failed sync",
+    detail: isZeroFallback
+      ? "Automatic sync could not find a reliable offset, so the sidecar kept its initial +0.000 s default."
+      : `Automatic sync could not find a reliable offset. ${incomingOffsetExplanation(player, carriedOffset)}`,
+    style: "",
   };
+  if (syncStatus === "error") return {
+    label: isZeroFallback ? "Zero fallback retained after sync error" : "Existing stream offset retained after sync error",
+    detail: isZeroFallback
+      ? "Automatic sync ended with an error, so the sidecar kept its initial +0.000 s default."
+      : `Automatic sync ended with an error. ${incomingOffsetExplanation(player, carriedOffset)}`,
+    style: "",
+  };
+  if (!isZeroFallback) return {
+    label: "Offset carried by incoming HLS URL",
+    detail: incomingOffsetExplanation(player, carriedOffset),
+    style: "",
+  };
+  return {
+    label: "Initial sidecar zero default",
+    detail: "The sidecar is using its initial +0.000 s value while it waits for a saved or calculated offset.",
+    style: "",
+  };
+}
+
+function databaseLookupInfo(player) {
+  if (player.cache_hit === true) return `Hit · ${player.cache_source || "unknown"}`;
+  if (player.cache_hit !== false) return "Not completed";
+  const syncStatus = String(player.sync_result?.status || "").toLowerCase();
+  if (syncStatus === "ok") return "Miss · automatic sync succeeded";
+  if (syncStatus === "incompatible") return "Miss · automatic sync failed (no reliable offset)";
+  if (syncStatus === "error") return "Miss · automatic sync ended with an error";
+  return "Miss · waiting for automatic sync";
 }
 
 function makeField(label, value, link = false) {
@@ -391,7 +436,9 @@ function createTrack(player) {
   const languageText = element("div");
   languageText.append(element("strong", "", lang.name), element("small", "", `HID ${player.hid}`));
   language.append(element("span", "language-mark", lang.code), languageText);
-  const registration = player.cached_audio ? "Reused cached signed playlist" : "Newly registered signed playlist";
+  const registration = player.cached_audio
+    ? "Existing fresh audio playlist reused from the sidecar cache"
+    : "Audio playlist received from ToastFlix and stored by the sidecar";
   const requestState = player.request_count > 0
     ? (player.active ? { text: "player stream active", style: "live" } : { text: "no recent player requests", style: "" })
     : (player.ended_at ? { text: "playback ended before streaming", style: "" } : { text: "prepared · waiting for player", style: "" });
@@ -406,7 +453,11 @@ function createTrack(player) {
   offsetHero.append(description, offsetNumber);
 
   const candidates = element("div", "candidate-list");
-  const candidateNames = { request: "Player URL value", cached: "Cached database value", calculated: "Sidecar calculated value", manual: "Manual value" };
+  const requestCandidateOffset = Number(player.offset_candidates?.request?.offset ?? 0);
+  const requestCandidateName = Math.abs(requestCandidateOffset) < 0.0005
+    ? "Sidecar initial zero default"
+    : "Offset carried by incoming HLS URL";
+  const candidateNames = { request: requestCandidateName, cached: "Cached database value", calculated: "Sidecar calculated value", manual: "Manual value" };
   Object.entries(player.offset_candidates || {}).forEach(([name, candidate]) => {
     const row = element("div", "candidate");
     row.append(
@@ -432,7 +483,7 @@ function createTrack(player) {
   const save = element("button", "button primary", "Apply manual offset");
   save.type = "button"; save.addEventListener("click", () => editPlayer(player.playback_id, offset.input.value, rate.input.value));
   const automaticLabels = {
-    cached: "DB cache", calculated: "sidecar calculation", request: "player URL",
+    cached: "DB cache", calculated: "sidecar calculation", request: "incoming HLS value",
   };
   const restoreButtons = ["cached", "calculated", "request"].flatMap((name) => {
     const candidate = player.offset_candidates?.[name];
@@ -468,8 +519,10 @@ function createTrack(player) {
   const dataGrid = element("div", "data-grid");
   [
     ["Track language", lang.name, false], ["Offset provenance", source.label, false],
-    ["Database lookup", player.cache_hit === true ? `Hit · ${player.cache_source || "unknown"}` : player.cache_hit === false ? "Miss · sidecar calculation used" : "Not completed", false],
-    ["Audio registration", registration, false],
+    ["Database lookup", databaseLookupInfo(player), false],
+    ["Audio playlist setup", registration, false],
+    ["Last HLS request type", player.last_request_kind || "None yet", false],
+    ["Last offset received in an HLS request", player.request_count ? `${formatOffset(player.last_requested_offset)} s` : "No HLS request received yet", false],
     ["Video URL", metadataValue(player, "video_url", "videoUrl", "videoURL", "stream_url", "streamUrl"), true],
     ["VPS host", metadataValue(player, "vpsHost", "vps_host"), true], ["Cache key", player.cache_key, false],
     ["Video fingerprint", metadataValue(player, "video_fingerprint", "videoFingerprint"), false],
@@ -552,11 +605,12 @@ function renderSessions(players) {
 
 function provenance(record) {
   if (record.details?.custom) return "Manual edit · automatic value retained";
-  if (record.details?.restored_source === "request") return "Restored player URL value";
+  if (record.details?.restored_source === "request") return "Restored sidecar fallback";
   if (record.details?.restored_source === "cached") return "Restored database cache";
   if (record.details?.restored_source === "calculated") return "Restored sidecar calculation";
   if (record.details?.cached) return `Database cache · ${record.details.cache_source || "unknown"}`;
   if (record.status === "ok") return "Sidecar calculation";
+  if (record.status === "incompatible") return "Automatic sync failed · no reliable offset";
   return record.status || "Unknown";
 }
 

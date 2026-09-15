@@ -92,7 +92,11 @@ class PlaybackRegistry:
                 "sync_result": None,
                 "sync_metadata": None,
                 "offset_candidates": {
-                    "request": {"offset": 0.0, "rate": 1.0, "source": "player URL"},
+                    "request": {
+                        "offset": 0.0,
+                        "rate": 1.0,
+                        "source": "sidecar initial zero default",
+                    },
                 },
             }
             self._players[playback_id] = player
@@ -185,7 +189,7 @@ class PlaybackRegistry:
             player["offset_candidates"]["request"] = {
                 "offset": float(requested_offset),
                 "rate": float(requested_rate),
-                "source": "player URL",
+                "source": "value carried by incoming HLS request",
             }
         player["last_requested_offset"] = float(requested_offset)
         player["last_requested_rate"] = float(requested_rate)
