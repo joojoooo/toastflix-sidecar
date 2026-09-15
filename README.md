@@ -15,12 +15,12 @@ GHCR significa GitHub Container Registry. L'immagine viene costruita da GitHub
 Actions e pubblicata su:
 
 ```text
-ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
+ghcr.io/joojoooo/toastflix-sidecar:latest
 ```
 
 ### 1. Creare il workflow GitHub
 
-Nel repository GitHub `qwertyuiop8899/toastflix-sidecar`:
+Nel repository GitHub `joojoooo/toastflix-sidecar`:
 
 1. Apri `Actions`.
 2. Premi `New workflow`.
@@ -152,7 +152,7 @@ SIDECAR_PUBLIC_URL=https://toast-audio.duckdns.org
 Clona il repository:
 
 ```bash
-git clone https://github.com/qwertyuiop8899/toastflix-sidecar.git
+git clone https://github.com/joojoooo/toastflix-sidecar.git
 cd toastflix-sidecar
 cp .env.example .env
 ```
@@ -184,7 +184,7 @@ build: .
 con:
 
 ```yaml
-image: ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
+image: ghcr.io/joojoooo/toastflix-sidecar:latest
 ```
 
 Poi esegui:
@@ -234,7 +234,7 @@ docker run -d \
   -p 3169:3107 \
   --env-file .env \
   -v toast-audio-data:/app/data \
-  ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
+  ghcr.io/joojoooo/toastflix-sidecar:latest
 ```
 
 ## Offset Audio

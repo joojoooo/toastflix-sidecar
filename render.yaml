@@ -4,7 +4,7 @@ services:
     runtime: image
     plan: free
     image:
-      url: ghcr.io/qwertyuiop8899/toastflix-sidecar:latest
+      url: ghcr.io/joojoooo/toastflix-sidecar:latest
     envVars:
       - key: SIDECAR_ADMIN_TOKEN
         generateValue: true
