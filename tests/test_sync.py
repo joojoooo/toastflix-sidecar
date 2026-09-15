@@ -203,6 +203,7 @@ class SyncPlaylistTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["cache_key"], "cache-key")
             self.assertEqual(offsets.lookup_payload["cache_key"], "cache-key")
             self.assertEqual(result["cache_key"], "cache-key")
+            self.assertTrue(result["cached"])
 
     async def test_audio_sample_playlist_declares_target_duration(self):
         with tempfile.TemporaryDirectory() as directory:

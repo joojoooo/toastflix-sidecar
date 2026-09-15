@@ -4,33 +4,34 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>ToastFlix Audio Control</title>
+  <title>ToastFlix Sidecar Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23ff5b21'/%3E%3Ctext x='32' y='44' text-anchor='middle' font-size='40' font-family='serif' font-weight='bold' fill='%230b0d0e'%3ET%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/dashboard.css">
 </head>
 <body>
-  <div class="noise"></div>
+  <div class="ambient"></div>
   <main class="shell">
     <header class="topbar">
-      <a class="brand" href="/dashboard" aria-label="ToastFlix audio control home">
+      <a class="brand" href="/dashboard">
         <span class="brand-mark">T</span>
-        <span><strong>ToastFlix</strong><small>Audio control room</small></span>
+        <span><strong>ToastFlix</strong><small>Sidecar observability console</small></span>
       </a>
       <div class="connection">
         <span id="live-dot" class="dot"></span>
         <span id="connection-label">Locked</span>
-        <button id="lock-button" class="ghost small" type="button" hidden>Lock</button>
+        <button id="lock-button" class="button subtle compact" type="button" hidden>Lock</button>
       </div>
     </header>
 
     <section id="login" class="login panel">
-      <div class="eyebrow">Protected console</div>
-      <h1>Hear the fix<br>as it happens.</h1>
-      <p>Enter the <code>SIDECAR_ADMIN_TOKEN</code> from your Render environment. It stays in this browser tab only.</p>
+      <p class="kicker">Protected operator console</p>
+      <h1>See every signal.<br><em>Move every frame.</em></h1>
+      <p>Enter <code>SIDECAR_ADMIN_TOKEN</code>. The token remains in this browser tab and authenticates the live event stream, traffic inspector, audio previews, and offset controls.</p>
       <form id="login-form">
         <label for="admin-token">Dashboard token</label>
         <div class="token-row">
           <input id="admin-token" type="password" autocomplete="current-password" required autofocus>
-          <button type="submit">Open console</button>
+          <button class="button primary" type="submit">Open console</button>
         </div>
         <p id="login-error" class="error" role="alert"></p>
       </form>
@@ -39,55 +40,98 @@
     <div id="console" hidden>
       <section class="hero">
         <div>
-          <div class="eyebrow">Live sidecar telemetry</div>
-          <h1>Audio, precisely<br><em>where it belongs.</em></h1>
+          <p class="kicker">Live via Server-Sent Events</p>
+          <h1>The whole sidecar,<br><em>without blind spots.</em></h1>
         </div>
-        <div class="hero-status panel">
-          <span>Server time</span>
-          <strong id="server-time">—</strong>
-          <span>Remote offset DB</span>
-          <strong id="remote-status">—</strong>
-        </div>
+        <dl class="server-facts panel">
+          <div><dt>Server time</dt><dd id="server-time">—</dd></div>
+          <div><dt>Offset database</dt><dd id="remote-status">—</dd></div>
+          <div>
+            <dt>Automatic DB uploads</dt>
+            <dd>
+              <label class="switch-control" title="When disabled, automatic sync results stay local until an administrator uploads the selected value.">
+                <input id="automatic-upload-toggle" type="checkbox" disabled>
+                <span class="switch-track" aria-hidden="true"></span>
+                <span id="automatic-upload-label">Loading…</span>
+              </label>
+            </dd>
+          </div>
+          <div><dt>Cache directory</dt><dd id="cache-status">—</dd></div>
+          <div><dt>Audio proxy</dt><dd id="proxy-status">—</dd></div>
+          <div><dt>Session TTL</dt><dd id="ttl-status">—</dd></div>
+          <div><dt>Traffic retained</dt><dd id="retention-status">—</dd></div>
+        </dl>
       </section>
 
       <div id="notice" class="notice" role="status" hidden></div>
 
-      <section>
+      <section class="section" id="now-section">
         <div class="section-heading">
-          <div>
-            <span class="index">01</span>
-            <h2>Active playback</h2>
-          </div>
-          <p>Edits are picked up by the next HLS request. Already buffered audio may take a moment to catch up.</p>
+          <div><span class="section-number">01</span><h2>Now playing</h2></div>
+          <p>One card per media session. Italian, English, or other prepared tracks are labelled inside the card instead of appearing as anonymous duplicate playbacks.</p>
         </div>
-        <div id="players" class="player-grid"></div>
-        <div id="no-players" class="empty panel">Waiting for ToastFlix to prepare an audio track…</div>
+        <div id="sessions" class="session-list"></div>
+        <div id="no-sessions" class="empty panel">Waiting for ToastFlix to prepare an audio track…</div>
       </section>
 
-      <section>
-        <div class="section-heading">
-          <div>
-            <span class="index">02</span>
-            <h2>Offset library</h2>
-          </div>
-          <p>Local records survive while the sidecar disk survives. Upload sends a selected edited record to the configured remote DB.</p>
+      <section id="history-section" class="section" hidden>
+        <div class="section-heading slim">
+          <div><span class="section-number">02</span><h2>Previous playback</h2></div>
+          <button id="history-toggle" class="button subtle" type="button">Show history</button>
         </div>
-        <div class="table-wrap panel">
-          <table>
-            <thead>
-              <tr><th>Media</th><th>Resolution</th><th>Offset</th><th>Rate</th><th>Origin</th><th>Updated</th><th></th></tr>
-            </thead>
+        <div id="history" class="session-list history" hidden></div>
+      </section>
+
+      <section class="section">
+        <div class="section-heading">
+          <div><span class="section-number">03</span><h2>Offset records</h2></div>
+          <p>Every local record, its original automatic value, edit history, and its available upload destination.</p>
+        </div>
+        <div class="table-panel panel">
+          <table class="offset-table">
+            <thead><tr><th>Media / cache key</th><th>Resolution</th><th>Current offset</th><th>Rate</th><th>Provenance</th><th>Actions</th></tr></thead>
             <tbody id="offset-rows"></tbody>
           </table>
           <div id="no-offsets" class="empty">No offset records yet.</div>
         </div>
       </section>
 
-      <section>
-        <div class="section-heading compact">
-          <div><span class="index">03</span><h2>Recent events</h2></div>
+      <section class="section">
+        <div class="section-heading">
+          <div><span class="section-number">04</span><h2>Sidecar decisions</h2></div>
+          <p>Internal playback state changes: preparation, cache decisions, measurements, player requests, manual edits, restores, and remote uploads.</p>
         </div>
-        <div id="events" class="event-list panel"></div>
+        <div class="table-panel panel">
+          <table class="decision-table">
+            <thead><tr><th>Time</th><th>Event</th><th>Playback</th><th>Complete details</th><th></th></tr></thead>
+            <tbody id="decision-rows"></tbody>
+          </table>
+          <div id="no-decisions" class="empty">No internal decisions yet.</div>
+        </div>
+      </section>
+
+      <section class="section traffic-section">
+        <div class="section-heading">
+          <div><span class="section-number">05</span><h2>Traffic inspector</h2></div>
+          <p>Inbound calls and responses to Stremio, plus every outbound media and database request. Select a row for complete headers and bodies.</p>
+        </div>
+        <div class="traffic-tools">
+          <input id="traffic-search" type="search" placeholder="Filter URL, method, category, status…">
+          <div id="traffic-filters" class="segmented">
+            <button class="selected" data-filter="all" type="button">All</button>
+            <button data-filter="stremio" type="button">Stremio / player</button>
+            <button data-filter="media" type="button">Media downloads</button>
+            <button data-filter="database" type="button">VPS / database</button>
+            <button data-filter="dashboard" type="button">Dashboard</button>
+          </div>
+        </div>
+        <div class="table-panel panel traffic-panel">
+          <table class="traffic-table">
+            <thead><tr><th>Time</th><th>Flow</th><th>Category</th><th>Method</th><th>URL</th><th>Status</th><th>Duration</th><th>Bytes</th></tr></thead>
+            <tbody id="traffic-rows"></tbody>
+          </table>
+          <div id="no-traffic" class="empty">No matching traffic.</div>
+        </div>
       </section>
 
       <footer>
@@ -96,6 +140,19 @@
       </footer>
     </div>
   </main>
+
+  <aside id="activity-drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-backdrop" data-close-drawer></div>
+    <div class="drawer-panel">
+      <header>
+        <div><p class="kicker">Complete transaction</p><h2 id="drawer-title">Traffic detail</h2></div>
+        <button class="button subtle" type="button" data-close-drawer>Close</button>
+      </header>
+      <div class="drawer-actions"><button id="copy-transaction" class="button primary" type="button">Copy complete JSON</button></div>
+      <div id="drawer-content" class="drawer-content"></div>
+    </div>
+  </aside>
+
   <script src="/dashboard.js" defer></script>
 </body>
 </html>

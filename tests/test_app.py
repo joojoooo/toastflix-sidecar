@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
 
 _cache = tempfile.TemporaryDirectory()
@@ -35,10 +36,51 @@ class DashboardApiTests(unittest.TestCase):
         )
 
         self.assertEqual(page.status_code, 200)
-        self.assertIn("ToastFlix Audio Control", page.text)
+        self.assertIn("ToastFlix Sidecar Console", page.text)
         self.assertEqual(denied.status_code, 401)
         self.assertEqual(allowed.status_code, 200)
         self.assertIn("players", allowed.json())
+
+    def test_rejected_request_body_is_still_captured_in_full(self):
+        response = self.client.patch(
+            "/api/dashboard/players/missing/offset",
+            json={"offset": 1.25, "marker": "complete-rejected-body"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        summary = next(
+            item for item in sidecar.activity._recent(50)
+            if "/api/dashboard/players/missing/offset" in item["url"]
+        )
+        detail = sidecar.activity._get(summary["id"])
+        self.assertIn("complete-rejected-body", detail["request_body"]["content"])
+
+    def test_automatic_upload_toggle_requires_admin_and_updates_dashboard_state(self):
+        denied = self.client.patch(
+            "/api/dashboard/settings/automatic-upload", json={"enabled": False}
+        )
+        self.assertEqual(denied.status_code, 401)
+
+        try:
+            changed = self.client.patch(
+                "/api/dashboard/settings/automatic-upload",
+                headers={"Authorization": "Bearer admin-test-token"},
+                json={"enabled": False},
+            )
+            state = self.client.get(
+                "/api/dashboard/state",
+                headers={"Authorization": "Bearer admin-test-token"},
+            )
+
+            self.assertEqual(changed.status_code, 200)
+            self.assertFalse(changed.json()["enabled"])
+            self.assertFalse(state.json()["server"]["automatic_remote_upload_enabled"])
+        finally:
+            self.client.patch(
+                "/api/dashboard/settings/automatic-upload",
+                headers={"Authorization": "Bearer admin-test-token"},
+                json={"enabled": True},
+            )
 
     def test_manual_offset_overrides_the_next_hls_playlist_request(self):
         hid = "a" * 16
@@ -70,6 +112,65 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(response.headers["x-sidecar-offset-source"], "manual")
         self.assertIn("o=-125", response.text)
         self.assertFalse(sidecar.playbacks.get(playback_id)["pending_player_request"])
+
+    def test_manual_upload_uses_the_current_calculated_or_custom_selection(self):
+        hid = "b" * 16
+        cache_key = "selected-upload-cache-key"
+        playback_id = sidecar.playbacks.register(
+            hid,
+            "player-test-token",
+            {"media_key": "movie:test:0:0", "language": "ita"},
+        )
+        sidecar.playbacks.bind(
+            hid,
+            "player-test-token",
+            {
+                "cache_key": cache_key,
+                "media_key": "movie:test:0:0",
+                "resolution": 1080,
+                "video_fingerprint": "video-fp",
+                "audio_fingerprint": "audio-fp",
+            },
+            {
+                "status": "ok",
+                "offset": 0.375,
+                "rate": 1.0002,
+                "confidence": 0.91,
+                "cached": False,
+            },
+        )
+        uploaded = {
+            "local_saved": True,
+            "remote_configured": True,
+            "remote_uploaded": True,
+            "remote_status": 200,
+        }
+
+        with patch.object(sidecar.offsets, "upload", new_callable=AsyncMock) as upload:
+            upload.return_value = uploaded
+            calculated = self.client.post(
+                f"/api/dashboard/offsets/{cache_key}/upload",
+                params={"playback_id": playback_id},
+                headers={"Authorization": "Bearer admin-test-token"},
+            )
+            calculated_selection = upload.await_args.args[2]
+
+            sidecar.playbacks.set_override(playback_id, -0.125, 0.9998)
+            custom = self.client.post(
+                f"/api/dashboard/offsets/{cache_key}/upload",
+                params={"playback_id": playback_id},
+                headers={"Authorization": "Bearer admin-test-token"},
+            )
+            custom_selection = upload.await_args.args[2]
+
+        self.assertEqual(calculated.status_code, 200)
+        self.assertEqual(calculated_selection["selected_for_upload"], "calculated")
+        self.assertEqual(calculated_selection["offset"], 0.375)
+        self.assertEqual(calculated_selection["rate"], 1.0002)
+        self.assertEqual(custom.status_code, 200)
+        self.assertEqual(custom_selection["selected_for_upload"], "manual")
+        self.assertEqual(custom_selection["offset"], -0.125)
+        self.assertEqual(custom_selection["rate"], 0.9998)
 
 
 if __name__ == "__main__":

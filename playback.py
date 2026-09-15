@@ -1,67 +1,30 @@
+import base64
 import hashlib
 import time
 from collections import deque
-from urllib.parse import urlsplit, urlunsplit
-
-
-SENSITIVE_NAMES = {
-    "access",
-    "authorization",
-    "cookie",
-    "headers",
-    "key",
-    "playlist",
-    "token",
-    "vpsaccess",
-}
-
-
-def _safe_url(value: str) -> str:
-    """Keep a URL useful for debugging without exposing signed query strings."""
-    try:
-        parts = urlsplit(str(value))
-    except ValueError:
-        return "[redacted URL]"
-    if not parts.scheme or not parts.netloc:
-        return str(value)[:300]
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def safe_metadata(value, key: str = ""):
-    """Recursively redact request credentials before retaining debug metadata."""
-    normalized = key.replace("_", "").lower()
-    if normalized in SENSITIVE_NAMES or any(
-        marker in normalized for marker in ("secret", "password", "credential")
-    ):
-        if normalized == "headers" and isinstance(value, dict):
-            return {"names": sorted(str(name) for name in value)}
-        return "[redacted]"
+    """Make captured metadata JSON-compatible without removing any fields."""
     if isinstance(value, dict):
         return {str(name): safe_metadata(item, str(name)) for name, item in value.items()}
-    if isinstance(value, list):
-        return [safe_metadata(item) for item in value[:100]]
-    if isinstance(value, str) and value.lower().startswith(("http://", "https://")):
-        return _safe_url(value)
-    if isinstance(value, str):
-        return value[:1000]
+    if isinstance(value, (list, tuple)):
+        return [safe_metadata(item) for item in value]
+    if isinstance(value, bytes):
+        return {"encoding": "base64", "content": base64.b64encode(value).decode("ascii")}
     return value
 
 
 def audio_debug_metadata(metadata: dict) -> dict:
     segments = metadata.get("segs") or []
     durations = metadata.get("durs") or []
-    result = {
-        str(key): safe_metadata(value, str(key))
-        for key, value in metadata.items()
-        if key not in {"segs", "headers"}
-    }
-    result["segments"] = {
+    result = safe_metadata(metadata)
+    result["segment_summary"] = {
         "count": len(segments),
         "duration_seconds": round(sum(float(value) for value in durations), 3),
-        "first_url": _safe_url(segments[0]) if segments else None,
-        "last_url": _safe_url(segments[-1]) if segments else None,
+        "first_url": segments[0] if segments else None,
+        "last_url": segments[-1] if segments else None,
     }
-    result["header_names"] = sorted(str(name) for name in (metadata.get("headers") or {}))
     return result
 
 
@@ -92,17 +55,26 @@ class PlaybackRegistry:
     def note(self, kind: str, **details):
         self._event(kind, **details)
 
-    def register(self, hid: str, token: str, metadata: dict, cached_audio: bool = False) -> str:
+    def register(self, hid: str, token: str, metadata: dict, cached_audio: bool = False,
+                 request_metadata: dict | None = None) -> str:
         now = time.time()
         playback_id = self._playback_id(hid, token)
         token_hash = self._token_hash(token)
+        media_key = str(metadata.get("media_key") or "")
+        if media_key:
+            for existing in self._players.values():
+                existing_media = str((existing.get("audio_metadata") or {}).get("media_key") or "")
+                if existing["token_hash"] == token_hash and existing_media and existing_media != media_key:
+                    existing["ended_at"] = now
         player = self._players.get(playback_id)
         if player is None:
             player = {
                 "playback_id": playback_id,
+                "session_id": token_hash[:12],
                 "hid": hid,
                 "token_hash": token_hash,
                 "created_at": now,
+                "ended_at": None,
                 "cache_key": None,
                 "resolution": None,
                 "current_offset": 0.0,
@@ -119,13 +91,18 @@ class PlaybackRegistry:
                 "cache_source": None,
                 "sync_result": None,
                 "sync_metadata": None,
+                "offset_candidates": {
+                    "request": {"offset": 0.0, "rate": 1.0, "source": "player URL"},
+                },
             }
             self._players[playback_id] = player
             self._keys[(token_hash, hid)] = playback_id
         player.update({
             "updated_at": now,
+            "ended_at": None,
             "cached_audio": bool(cached_audio),
             "audio_metadata": audio_debug_metadata(metadata),
+            "prepare_request": safe_metadata(request_metadata or {}),
         })
         self._event("audio-cache" if cached_audio else "audio-prepared", playback_id, hid=hid)
         self._prune()
@@ -150,12 +127,34 @@ class PlaybackRegistry:
             "sync_metadata": safe_metadata(payload),
         })
         if result.get("status", "ok") == "ok" and isinstance(result.get("offset"), (int, float)):
-            player["current_offset"] = float(result["offset"])
-            player["current_rate"] = float(result.get("rate", 1.0))
-            player["control_source"] = (
-                f"cached:{cache_source or 'unknown'}" if result.get("cached") else "measured"
-            )
-            player["revision"] += 1
+            candidate = {
+                "offset": float(result["offset"]),
+                "rate": float(result.get("rate", 1.0)),
+                "confidence": result.get("confidence"),
+                "source": cache_source or ("database" if result.get("cached") else "sidecar calculation"),
+                "result": safe_metadata(result),
+            }
+            is_custom = bool(result.get("custom"))
+            automatic = result.get("automatic_result")
+            if is_custom:
+                player["offset_candidates"]["manual"] = candidate
+                if isinstance(automatic, dict) and isinstance(automatic.get("offset"), (int, float)):
+                    player["offset_candidates"]["cached"] = {
+                        "offset": float(automatic["offset"]),
+                        "rate": float(automatic.get("rate", 1.0)),
+                        "confidence": automatic.get("confidence"),
+                        "source": "original automatic value",
+                        "result": safe_metadata(automatic),
+                    }
+                selected_source = "manual"
+            else:
+                selected_source = "cached" if result.get("cached") else "calculated"
+                player["offset_candidates"][selected_source] = candidate
+            if player["control_source"] != "manual" or is_custom:
+                player["current_offset"] = candidate["offset"]
+                player["current_rate"] = candidate["rate"]
+                player["control_source"] = selected_source
+                player["revision"] += 1
         event_kind = (
             "offset-cache-hit" if result.get("cached")
             else "sync-complete" if result.get("status", "ok") == "ok"
@@ -183,6 +182,11 @@ class PlaybackRegistry:
         if player["control_source"] == "request":
             player["current_offset"] = float(requested_offset)
             player["current_rate"] = float(requested_rate)
+            player["offset_candidates"]["request"] = {
+                "offset": float(requested_offset),
+                "rate": float(requested_rate),
+                "source": "player URL",
+            }
         player["last_requested_offset"] = float(requested_offset)
         player["last_requested_rate"] = float(requested_rate)
         player["last_request_at"] = time.time()
@@ -215,6 +219,9 @@ class PlaybackRegistry:
             "updated_at": time.time(),
             "revision": player["revision"] + 1,
         })
+        player["offset_candidates"]["manual"] = {
+            "offset": float(offset), "rate": float(rate), "source": "dashboard edit",
+        }
         self._event(
             "manual-offset-saved", playback_id,
             cache_key=player.get("cache_key"), offset=offset, rate=rate,
@@ -230,12 +237,77 @@ class PlaybackRegistry:
             changed += 1
         return changed
 
+    def restore_automatic(self, playback_id: str, requested_source: str | None = None) -> dict:
+        player = self._players.get(playback_id)
+        if not player:
+            raise KeyError("active playback not found")
+        candidates = player.get("offset_candidates") or {}
+        if requested_source:
+            if requested_source not in {"calculated", "cached", "request"}:
+                raise KeyError("automatic offset source must be calculated, cached, or request")
+            if requested_source not in candidates:
+                raise KeyError(f"{requested_source} offset is not available for this playback")
+            source = requested_source
+        else:
+            source = next(
+                (name for name in ("calculated", "cached", "request") if name in candidates),
+                None,
+            )
+        if not source:
+            raise KeyError("no automatic offset is available for this playback")
+        candidate = candidates[source]
+        player.update({
+            "current_offset": float(candidate["offset"]),
+            "current_rate": float(candidate.get("rate", 1.0)),
+            "control_source": source,
+            "updated_at": time.time(),
+            "revision": player["revision"] + 1,
+        })
+        player["offset_candidates"].pop("manual", None)
+        self._event(
+            "manual-offset-restored", playback_id, cache_key=player.get("cache_key"),
+            offset=player["current_offset"], source=source,
+        )
+        return self._public_player(player)
+
+    def context_for_cache(self, cache_key: str) -> dict:
+        matches = [player for player in self._players.values() if player.get("cache_key") == cache_key]
+        if not matches:
+            return {}
+        latest = max(matches, key=lambda player: player.get("updated_at") or 0)
+        metadata = {
+            **(latest.get("prepare_request") or {}),
+            **(latest.get("sync_metadata") or {}),
+        }
+        return {
+            "vpsHost": metadata.get("vpsHost") or metadata.get("vps_host") or "",
+            "vpsAccess": metadata.get("vpsAccess") or metadata.get("vps_access") or "",
+            "provider": metadata.get("provider") or "",
+            "server": metadata.get("server") or "",
+            "title": metadata.get("title") or "",
+        }
+
+    def restore_for_cache(self, cache_key: str) -> int:
+        restored = 0
+        for player in list(self._players.values()):
+            if player.get("cache_key") != cache_key:
+                continue
+            try:
+                self.restore_automatic(player["playback_id"])
+                restored += 1
+            except KeyError:
+                continue
+        return restored
+
     @staticmethod
     def _public_player(player: dict) -> dict:
         result = {key: value for key, value in player.items() if key != "token_hash"}
         result["pending_player_request"] = player["revision"] > player["applied_revision"]
         last_request = player.get("last_request_at") or 0
-        result["active"] = time.time() - last_request < 120 if last_request else False
+        recently_updated = time.time() - (player.get("updated_at") or 0) < 120
+        result["active"] = not player.get("ended_at") and (
+            time.time() - last_request < 120 if last_request else recently_updated
+        )
         return result
 
     def get(self, playback_id: str) -> dict | None:

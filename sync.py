@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import math
 import os
 import re
@@ -11,6 +12,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from activity import logged_http_request
 from audio import AudioStore
 from offsets import OffsetStore
 from security import resolves_publicly, valid_public_url
@@ -28,6 +30,7 @@ class SyncEngine:
         self.audio = audio
         self.offsets = offsets
         self.proxy = proxy
+        self.activity = getattr(audio, "activity", None)
         self.sample_seconds = 5
 
     async def _get(self, url: str, headers: dict):
@@ -38,7 +41,9 @@ class SyncEngine:
             kwargs["proxy"] = self.proxy
         try:
             async with httpx.AsyncClient(**kwargs) as client:
-                response = await client.get(url, headers=headers)
+                response = await logged_http_request(
+                    self.activity, client, "GET", url, "sync-source", headers=headers
+                )
         except httpx.HTTPError as exc:
             raise RuntimeError(f"media fetch failed: {exc}") from exc
         if response.status_code in (301, 302, 307, 308):
@@ -228,6 +233,74 @@ class SyncEngine:
             raise RuntimeError((error.decode(errors="replace") or "sample decode failed")[:300])
 
     @staticmethod
+    async def _wav(playlist: Path, seek: float, output: Path, sample_seconds: float = 8.0):
+        command = [
+            "ffmpeg", "-v", "error", "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,crypto", "-i", str(playlist),
+            "-ss", f"{max(0.0, seek):.3f}", "-t", f"{sample_seconds:g}",
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "48000",
+            "-c:a", "pcm_s16le", "-y", str(output),
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, error = await asyncio.wait_for(process.communicate(), timeout=60)
+        if process.returncode or not output.exists() or output.stat().st_size <= 44:
+            raise RuntimeError((error.decode(errors="replace") or "ffmpeg preview failed")[:500])
+
+    async def manual_preview(self, payload: dict, kind: str, position: float,
+                             sample_seconds: float = 8.0) -> Path:
+        if kind not in {"reference", "replacement"}:
+            raise ValueError("preview kind must be reference or replacement")
+        audio_hid = str(payload.get("audio_hid") or "")
+        if not audio_hid:
+            raise ValueError("playback has no audio_hid")
+        position = max(0.0, float(position))
+        sample_seconds = min(20.0, max(2.0, float(sample_seconds)))
+        fingerprint = str(
+            payload.get("video_fingerprint") or payload.get("video_url") or "video"
+        )
+        preview_key = hashlib.sha1(
+            f"{kind}|{fingerprint}|{position:.3f}|{sample_seconds:.3f}".encode()
+        ).hexdigest()[:12]
+        output = self.audio._dir(audio_hid) / (
+            f"align_{kind}_{int(round(position * 1000))}_{preview_key}.wav"
+        )
+        if output.exists() and output.stat().st_size > 44:
+            return output
+        with tempfile.TemporaryDirectory(prefix="sidecar-align-") as directory:
+            root = Path(directory)
+            if kind == "replacement":
+                playlist, seek, _ = await self._decode_audio(
+                    audio_hid, position, root, sample_seconds=sample_seconds
+                )
+            else:
+                video_headers = (
+                    payload.get("video_headers")
+                    if isinstance(payload.get("video_headers"), dict) else {}
+                )
+                reference_url = str(
+                    payload.get("reference_audio_url") or payload.get("referenceAudio") or ""
+                ).strip()
+                if reference_url:
+                    playlist, seek, _ = await self._decode_reference_audio(
+                        reference_url, video_headers, position, root,
+                        sample_seconds=sample_seconds,
+                    )
+                else:
+                    video_url = str(payload.get("video_url") or "")
+                    if not video_url:
+                        raise ValueError("playback has no video or reference audio URL")
+                    playlist, seek, _ = await self._decode_video(
+                        video_url, video_headers, position, root,
+                        sample_seconds=sample_seconds,
+                    )
+            temporary_output = root / "preview.wav"
+            await self._wav(playlist, seek, temporary_output, sample_seconds)
+            shutil.copy2(temporary_output, output)
+        return output
+
+    @staticmethod
     def _envelope(path: Path):
         values = array("h")
         values.frombytes(path.read_bytes())
@@ -394,8 +467,8 @@ class SyncEngine:
             "resolution": resolution,
             "video_fingerprint": video_fp,
             "audio_fingerprint": audio_fp,
-            "vpsAccess": payload.get("vpsAccess", ""),
-            "vpsHost": payload.get("vpsHost", ""),
+            "vpsAccess": payload.get("vpsAccess") or payload.get("vps_access") or "",
+            "vpsHost": payload.get("vpsHost") or payload.get("vps_host") or "",
             "video_url": video_url,
             "provider": payload.get("provider", ""),
             "server": payload.get("server", ""),
@@ -415,7 +488,7 @@ class SyncEngine:
         if lookup and not retry_old_vidfast:
             cached_value = dict(lookup.get("details") or lookup)
             cached_value.pop("_cache_source", None)
-            result = {"status": "ok", "cached": True, **cached_value}
+            result = {"status": "ok", **cached_value, "cached": True}
             if reference_audio_url and not result.get("video_start_time"):
                 lookup = None
             else:

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import httpx
 
+from activity import logged_http_request
+
 
 class OffsetStore:
     """Local offset cache with an optional central VPS lookup/report endpoint."""
@@ -22,12 +24,14 @@ class OffsetStore:
         "title",
     )
 
-    def __init__(self, path: str, api_url: str = "", api_token: str = ""):
+    def __init__(self, path: str, api_url: str = "", api_token: str = "", activity=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token.strip()
+        self.activity = activity
         self._init_db()
+        self._automatic_upload_enabled = self._load_automatic_upload_enabled()
 
     def _connect(self):
         conn = sqlite3.connect(self.path, timeout=30)
@@ -51,6 +55,39 @@ class OffsetStore:
                     updated_at REAL NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+
+    def _load_automatic_upload_enabled(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                ("automatic_remote_upload",),
+            ).fetchone()
+        return True if not row else str(row[0]).strip().lower() == "true"
+
+    @property
+    def automatic_upload_enabled(self) -> bool:
+        return self._automatic_upload_enabled
+
+    def _save_automatic_upload_enabled(self, enabled: bool):
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO settings (key, value, updated_at)
+                   VALUES (?, ?, ?)""",
+                ("automatic_remote_upload", "true" if enabled else "false", time.time()),
+            )
+
+    async def set_automatic_upload_enabled(self, enabled: bool) -> bool:
+        enabled = bool(enabled)
+        await asyncio.to_thread(self._save_automatic_upload_enabled, enabled)
+        self._automatic_upload_enabled = enabled
+        return enabled
 
     @staticmethod
     def key(media_key: str, resolution: int, video_fp: str, audio_fp: str) -> str:
@@ -93,8 +130,22 @@ class OffsetStore:
     @classmethod
     def _remote_payload(cls, payload: dict) -> dict:
         result = {name: payload[name] for name in cls.REMOTE_FIELDS if name in payload}
-        if payload.get("vpsAccess"):
-            result["access"] = payload["vpsAccess"]
+        dynamic_access = payload.get("vpsAccess") or payload.get("vps_access")
+        if dynamic_access:
+            result["access"] = dynamic_access
+        return result
+
+    @staticmethod
+    def _remote_context(payload: dict) -> dict:
+        result = {
+            name: payload.get(name)
+            for name in ("vpsHost", "vpsAccess", "provider", "server", "title")
+            if payload.get(name) not in (None, "")
+        }
+        if not result.get("vpsHost") and payload.get("vps_host"):
+            result["vpsHost"] = payload["vps_host"]
+        if not result.get("vpsAccess") and payload.get("vps_access"):
+            result["vpsAccess"] = payload["vps_access"]
         return result
 
     async def lookup(self, payload: dict):
@@ -103,14 +154,18 @@ class OffsetStore:
             local_result["_cache_source"] = "local-custom"
             return local_result
         api_url = self.api_url
-        if not api_url and payload.get("vpsHost"):
-            api_url = f"{str(payload['vpsHost']).rstrip('/')}/dual/offset"
+        dynamic_host = payload.get("vpsHost") or payload.get("vps_host")
+        if not api_url and dynamic_host:
+            api_url = f"{str(dynamic_host).rstrip('/')}/dual/offset"
         if api_url:
             try:
                 headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
                 central_payload = self._remote_payload(payload)
                 async with httpx.AsyncClient(timeout=8) as client:
-                    response = await client.post(f"{api_url}/lookup", json=central_payload, headers=headers)
+                    response = await logged_http_request(
+                        self.activity, client, "POST", f"{api_url}/lookup", "offset-db",
+                        json=central_payload, headers=headers,
+                    )
                 if response.status_code == 200:
                     data = response.json()
                     if data.get("found") and data.get("offset") is not None:
@@ -118,6 +173,9 @@ class OffsetStore:
                         if not isinstance(result, dict):
                             result = {"status": "ok", "offset": float(result), "rate": 1.0}
                         cache_value = dict(result.get("details") or result)
+                        context = self._remote_context(payload)
+                        if context:
+                            cache_value["remote_context"] = context
                         if all(name in payload for name in (
                             "cache_key", "media_key", "resolution",
                             "video_fingerprint", "audio_fingerprint",
@@ -149,19 +207,32 @@ class OffsetStore:
                 ),
             )
 
-    async def report(self, payload: dict, result: dict):
-        await asyncio.to_thread(self._local_put, payload, result)
+    async def report(self, payload: dict, result: dict, upload_remote: bool = True):
+        local_result = dict(result)
+        context = self._remote_context(payload)
+        if context:
+            local_result["remote_context"] = context
+        await asyncio.to_thread(self._local_put, payload, local_result)
         api_url = self.api_url
-        if not api_url and payload.get("vpsHost"):
-            api_url = f"{str(payload['vpsHost']).rstrip('/')}/dual/offset"
+        dynamic_host = payload.get("vpsHost") or payload.get("vps_host")
+        if not api_url and dynamic_host:
+            api_url = f"{str(dynamic_host).rstrip('/')}/dual/offset"
+        if not upload_remote:
+            return {
+                "local_saved": True,
+                "remote_configured": bool(api_url),
+                "remote_uploaded": False,
+                "remote_skipped": True,
+                "remote_skip_reason": "automatic remote uploads are disabled by the administrator",
+            }
         if not api_url:
             return {"local_saved": True, "remote_configured": False, "remote_uploaded": False}
         try:
             headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
             central_payload = {**self._remote_payload(payload), "offset": result}
             async with httpx.AsyncClient(timeout=8) as client:
-                response = await client.post(
-                    f"{api_url}/report",
+                response = await logged_http_request(
+                    self.activity, client, "POST", f"{api_url}/report", "offset-db",
                     json=central_payload,
                     headers=headers,
                 )
@@ -186,15 +257,26 @@ class OffsetStore:
         record = await self.get(cache_key)
         if not record and not metadata:
             raise KeyError("offset record not found")
-        details = dict((record or {}).get("details") or {})
+        details = dict(
+            (record or {}).get("details")
+            or ((metadata or {}).get("_automatic_result") or {})
+        )
+        if not details.get("custom"):
+            details["automatic_result"] = dict(details)
+        history = list(details.get("manual_history") or [])
+        history.append({
+            "offset": float(offset), "rate": float(rate), "note": str(note or "")[:500],
+            "updated_at": time.time(),
+        })
         details.update({
             "status": "ok",
             "offset": float(offset),
             "rate": float(rate),
-            "confidence": float(details.get("confidence", record.get("confidence") or 0.0)),
+            "confidence": float(details.get("confidence", (record or {}).get("confidence") or 0.0)),
             "custom": True,
             "custom_note": str(note or "")[:500],
             "custom_updated_at": time.time(),
+            "manual_history": history[-50:],
         })
         source = record or metadata or {}
         required = ("media_key", "resolution", "video_fingerprint", "audio_fingerprint")
@@ -204,18 +286,27 @@ class OffsetStore:
         await asyncio.to_thread(self._local_put, payload, details)
         return await self.get(cache_key)
 
-    async def upload(self, cache_key: str):
-        """Upload one locally edited record using the configured central API."""
+    async def restore_automatic(self, cache_key: str, value: dict | None = None,
+                                source: str = "automatic"):
         record = await self.get(cache_key)
         if not record:
             raise KeyError("offset record not found")
-        if not self.api_url:
-            return {
-                "local_saved": True,
-                "remote_configured": False,
-                "remote_uploaded": False,
-                "remote_error": "OFFSET_API_URL is not configured",
-            }
+        details = dict(record.get("details") or {})
+        automatic = value or details.get("automatic_result")
+        if not isinstance(automatic, dict) or not isinstance(automatic.get("offset"), (int, float)):
+            raise KeyError("this record has no previous automatic offset")
+        restored = dict(automatic)
+        restored.setdefault("status", "ok")
+        restored.setdefault("rate", 1.0)
+        restored.setdefault("confidence", float(record.get("confidence") or 0.0))
+        restored.update({
+            "custom": False,
+            "restored_at": time.time(),
+            "restored_source": str(source or "automatic"),
+            "manual_history": details.get("manual_history") or [],
+        })
+        if details.get("remote_context") and not restored.get("remote_context"):
+            restored["remote_context"] = details["remote_context"]
         payload = {
             "cache_key": record["cache_key"],
             "media_key": record["media_key"],
@@ -223,4 +314,41 @@ class OffsetStore:
             "video_fingerprint": record["video_fingerprint"],
             "audio_fingerprint": record["audio_fingerprint"],
         }
-        return await self.report(payload, dict(record.get("details") or {}))
+        await asyncio.to_thread(self._local_put, payload, restored)
+        return await self.get(cache_key)
+
+    async def upload(self, cache_key: str, context: dict | None = None,
+                     selected_result: dict | None = None):
+        """Explicitly upload the selected local/player value, bypassing the automatic toggle."""
+        record = await self.get(cache_key)
+        if not record:
+            raise KeyError("offset record not found")
+        stored_context = (record.get("details") or {}).get("remote_context") or {}
+        context = {
+            **stored_context,
+            **{
+                key: value for key, value in (context or {}).items()
+                if value not in (None, "")
+            },
+        }
+        dynamic_host = str(context.get("vpsHost") or "").strip().rstrip("/")
+        if not self.api_url and not dynamic_host:
+            return {
+                "local_saved": True,
+                "remote_configured": False,
+                "remote_uploaded": False,
+                "remote_error": "Neither OFFSET_API_URL nor an active playback vpsHost is available",
+            }
+        payload = {
+            "cache_key": record["cache_key"],
+            "media_key": record["media_key"],
+            "resolution": record["resolution"],
+            "video_fingerprint": record["video_fingerprint"],
+            "audio_fingerprint": record["audio_fingerprint"],
+            **context,
+        }
+        result = dict(record.get("details") or {})
+        if selected_result:
+            result.update(selected_result)
+        result["manually_uploaded_at"] = time.time()
+        return await self.report(payload, result, upload_remote=True)

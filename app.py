@@ -1,3 +1,4 @@
+import asyncio
 import json
 import hmac
 import math
@@ -8,8 +9,9 @@ from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from activity import ActivityLog, TrafficLogMiddleware
 from audio import AudioStore
 from offsets import OffsetStore
 from playback import PlaybackRegistry
@@ -27,14 +29,18 @@ OFFSET_API_URL = os.getenv("OFFSET_API_URL", "").strip()
 OFFSET_API_TOKEN = os.getenv("OFFSET_API_TOKEN", "").strip()
 BOOTSTRAP_KEY = os.getenv("SIDECAR_BOOTSTRAP_KEY", "").strip()
 ADMIN_TOKEN = os.getenv("SIDECAR_ADMIN_TOKEN", "").strip()
+ACTIVITY_MAX_ROWS = int(os.getenv("SIDECAR_ACTIVITY_MAX_ROWS", "5000"))
 
-audio = AudioStore(str(CACHE_DIR / "audio"), proxy=AUDIO_PROXY)
-offsets = OffsetStore(str(CACHE_DIR / "offsets.db"), OFFSET_API_URL, OFFSET_API_TOKEN)
+activity = ActivityLog(str(CACHE_DIR / "activity.db"), ACTIVITY_MAX_ROWS)
+audio = AudioStore(str(CACHE_DIR / "audio"), proxy=AUDIO_PROXY, activity=activity)
+offsets = OffsetStore(
+    str(CACHE_DIR / "offsets.db"), OFFSET_API_URL, OFFSET_API_TOKEN, activity=activity
+)
 sessions = SessionManager(SESSION_TTL, FIXED_TOKEN)
 sync_engine = SyncEngine(audio, offsets, AUDIO_PROXY)
 playbacks = PlaybackRegistry()
 
-app = FastAPI(title="Toast Audio Sidecar", version="1.1")
+app = FastAPI(title="Toast Audio Sidecar", version="1.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()],
@@ -43,6 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Sidecar-Offset", "X-Sidecar-Offset-Source", "X-Sidecar-Revision"],
 )
+app.add_middleware(TrafficLogMiddleware, activity=activity)
 
 
 def _require_session(request: Request, body: dict | None = None) -> str:
@@ -102,7 +109,8 @@ def _dashboard_file(name: str):
     response.headers["Cache-Control"] = "no-cache"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; style-src 'self'; script-src 'self'; "
-        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'"
+        "connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; "
+        "base-uri 'none'; frame-ancestors 'none'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
@@ -156,7 +164,7 @@ async def prepare_audio(request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
     language = str(body.get("lang") or "").lower()
     metadata = audio.metadata(hid)
-    playbacks.register(hid, token, metadata, cached_audio=False)
+    playbacks.register(hid, token, metadata, cached_audio=False, request_metadata=body)
     return JSONResponse({
         "hid": hid,
         "url": _audio_url(request, hid, token),
@@ -173,7 +181,7 @@ async def cached_audio(request: Request):
     if not hid:
         raise HTTPException(status_code=404, detail="valid cached audio track not found")
     metadata = audio.metadata(hid)
-    playbacks.register(hid, token, metadata, cached_audio=True)
+    playbacks.register(hid, token, metadata, cached_audio=True, request_metadata=body)
     return {
         "url": _audio_url(request, hid, token),
         "cached": True,
@@ -295,7 +303,9 @@ async def offset_report(request: Request):
     result = body.get("offset")
     if not isinstance(result, dict):
         raise HTTPException(status_code=400, detail="offset result required")
-    report_status = await offsets.report(body, result)
+    report_status = await offsets.report(
+        body, result, upload_remote=offsets.automatic_upload_enabled
+    )
     hid = str(body.get("audio_hid") or body.get("hid") or "")
     if hid:
         playbacks.bind(hid, token, body, result)
@@ -318,7 +328,9 @@ async def sync_audio(request: Request):
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             })
         raise HTTPException(status_code=422, detail=str(exc))
-    report_status = await offsets.report(body, result)
+    report_status = await offsets.report(
+        body, result, upload_remote=offsets.automatic_upload_enabled
+    )
     result["storage"] = report_status
     hid = str(body.get("audio_hid") or "")
     if hid:
@@ -334,10 +346,44 @@ async def sync_audio(request: Request):
     return result
 
 
-@app.get("/api/dashboard/state", include_in_schema=False)
-async def dashboard_state(request: Request):
-    _require_admin(request)
+async def _dashboard_snapshot(include_activity: bool = True, include_tracks: bool = True,
+                              include_offsets: bool = True):
     state = playbacks.snapshot()
+    if include_tracks:
+        inspected = {}
+        for player in state["players"]:
+            hid = player.get("hid")
+            if not hid:
+                continue
+            if hid not in inspected:
+                try:
+                    inspected[hid] = audio.inspect(hid)
+                except (ValueError, FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+                    inspected[hid] = {"hid": hid, "error": f"{type(exc).__name__}: {exc}"}
+            player["audio_track"] = inspected[hid]
+    offset_records = await offsets.list() if include_offsets else None
+    dynamic_hosts = sorted({
+        str(
+            (player.get("sync_metadata") or {}).get("vpsHost")
+            or (player.get("sync_metadata") or {}).get("vps_host")
+            or (player.get("prepare_request") or {}).get("vpsHost")
+            or (player.get("prepare_request") or {}).get("vps_host")
+        ).rstrip("/")
+        for player in state["players"]
+        if (
+            (player.get("sync_metadata") or {}).get("vpsHost")
+            or (player.get("sync_metadata") or {}).get("vps_host")
+            or (player.get("prepare_request") or {}).get("vpsHost")
+            or (player.get("prepare_request") or {}).get("vps_host")
+        )
+    })
+    if offset_records is not None:
+        for record in offset_records:
+            stored_context = (record.get("details") or {}).get("remote_context") or {}
+            record["upload_context"] = {
+                **stored_context,
+                **{key: value for key, value in playbacks.context_for_cache(record["cache_key"]).items() if value},
+            }
     state.update({
         "server": {
             "service": "toast-audio-sidecar",
@@ -346,12 +392,148 @@ async def dashboard_state(request: Request):
             "public_url": PUBLIC_BASE_URL or None,
             "cache_dir": str(CACHE_DIR),
             "remote_db_configured": bool(OFFSET_API_URL),
+            "configured_offset_api_url": OFFSET_API_URL or None,
+            "dynamic_vps_hosts": dynamic_hosts,
+            "automatic_remote_upload_enabled": offsets.automatic_upload_enabled,
             "audio_proxy_configured": bool(AUDIO_PROXY),
             "session_ttl_seconds": SESSION_TTL,
+            "activity_max_rows": activity.max_rows,
         },
-        "offsets": await offsets.list(),
     })
+    if offset_records is not None:
+        state["offsets"] = offset_records
+    if include_activity:
+        state["activity"] = await activity.recent(400)
     return state
+
+
+@app.get("/api/dashboard/state", include_in_schema=False)
+async def dashboard_state(request: Request):
+    _require_admin(request)
+    return JSONResponse(
+        await _dashboard_snapshot(include_activity=True),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/dashboard/events", include_in_schema=False)
+async def dashboard_events(request: Request):
+    _require_admin(request)
+
+    async def stream():
+        queue = activity.subscribe()
+        try:
+            initial = {"type": "snapshot", "state": await _dashboard_snapshot(True, True, True)}
+            yield f"event: snapshot\ndata: {json.dumps(initial, ensure_ascii=False, default=str)}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    first = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                changes = [first]
+                await asyncio.sleep(0.12)
+                while not queue.empty() and len(changes) < 100:
+                    changes.append(queue.get_nowait())
+                urls = [str(change.get("url") or "") for change in changes]
+                include_tracks = any(
+                    "/dual/aprep" in url or "/dual/acache" in url or "/sync" in url
+                    for url in urls
+                )
+                include_offsets = any(
+                    marker in url
+                    for url in urls
+                    for marker in ("/sync", "/offset/report", "/api/dashboard/offsets", "/api/dashboard/players")
+                )
+                update = {
+                    "type": "update",
+                    "state": await _dashboard_snapshot(False, include_tracks, include_offsets),
+                    "activity": changes,
+                }
+                yield f"event: update\ndata: {json.dumps(update, ensure_ascii=False, default=str)}\n\n"
+        finally:
+            activity.unsubscribe(queue)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
+
+
+@app.get("/api/dashboard/activity/{activity_id}", include_in_schema=False)
+async def dashboard_activity_detail(activity_id: int, request: Request):
+    _require_admin(request)
+    detail = await activity.get(activity_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="activity record not found")
+    return JSONResponse(detail, headers={"Cache-Control": "no-store"})
+
+
+@app.patch("/api/dashboard/settings/automatic-upload", include_in_schema=False)
+async def dashboard_automatic_upload_setting(request: Request):
+    _require_admin(request)
+    body = await request.json()
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be a boolean")
+    saved = await offsets.set_automatic_upload_enabled(enabled)
+    playbacks.note("automatic-upload-setting", enabled=saved)
+    return {
+        "ok": True,
+        "enabled": saved,
+        "message": (
+            "Automatic remote uploads enabled."
+            if saved else
+            "Automatic remote uploads disabled; sync results will remain local until an admin uploads one."
+        ),
+    }
+
+
+@app.get("/api/dashboard/audio/{hid}/segments/{idx}/preview.wav", include_in_schema=False)
+async def dashboard_audio_preview(hid: str, idx: int, request: Request):
+    _require_admin(request)
+    try:
+        path = await audio.preview(hid, idx)
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return FileResponse(path, media_type="audio/wav", filename=f"{hid}-segment-{idx}.wav", headers={
+        "Cache-Control": "private, max-age=3600",
+        "Accept-Ranges": "bytes",
+    })
+
+
+@app.get("/api/dashboard/players/{playback_id}/alignment/{kind}.wav", include_in_schema=False)
+async def dashboard_alignment_preview(playback_id: str, kind: str, request: Request,
+                                      position: float = 60.0, seconds: float = 8.0):
+    _require_admin(request)
+    player = playbacks.get(playback_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="playback not found")
+    payload = {
+        **(player.get("prepare_request") or {}),
+        **(player.get("sync_metadata") or {}),
+    }
+    payload["video_url"] = (
+        payload.get("video_url") or payload.get("videoUrl") or payload.get("videoURL") or ""
+    )
+    payload["video_headers"] = payload.get("video_headers") or payload.get("videoHeaders") or {}
+    payload["reference_audio_url"] = (
+        payload.get("reference_audio_url") or payload.get("referenceAudioUrl")
+        or payload.get("referenceAudio") or ""
+    )
+    payload["audio_hid"] = player["hid"]
+    try:
+        path = await sync_engine.manual_preview(payload, kind, position, seconds)
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return FileResponse(
+        path, media_type="audio/wav",
+        filename=f"{playback_id}-{kind}-{position:.3f}.wav",
+        headers={"Cache-Control": "private, max-age=3600", "Accept-Ranges": "bytes"},
+    )
 
 
 @app.patch("/api/dashboard/players/{playback_id}/offset", include_in_schema=False)
@@ -365,9 +547,14 @@ async def dashboard_edit_player(playback_id: str, request: Request):
     record = None
     if player.get("cache_key"):
         try:
+            metadata = dict(player.get("sync_metadata") or {})
+            candidates = player.get("offset_candidates") or {}
+            automatic = candidates.get("calculated") or candidates.get("cached") or candidates.get("request")
+            if automatic:
+                metadata["_automatic_result"] = dict(automatic.get("result") or automatic)
             record = await offsets.update_custom(
                 player["cache_key"], offset, rate, str(body.get("note") or ""),
-                player.get("sync_metadata"),
+                metadata,
             )
         except KeyError:
             record = None
@@ -382,6 +569,35 @@ async def dashboard_edit_player(playback_id: str, request: Request):
             if record else
             "Applied live in memory. Save it again after sync exposes a cache key to persist it."
         ),
+    }
+
+
+@app.post("/api/dashboard/players/{playback_id}/offset/restore", include_in_schema=False)
+async def dashboard_restore_player(playback_id: str, request: Request,
+                                   source: str | None = None):
+    _require_admin(request)
+    player = playbacks.get(playback_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="active playback not found")
+    try:
+        updated = playbacks.restore_automatic(playback_id, source)
+    except KeyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    record = None
+    if player.get("cache_key"):
+        try:
+            selected = (player.get("offset_candidates") or {}).get(updated["control_source"]) or {}
+            value = dict(selected.get("result") or selected)
+            record = await offsets.restore_automatic(
+                player["cache_key"], value, updated["control_source"]
+            )
+        except KeyError:
+            record = None
+    return {
+        "ok": True,
+        "player": updated,
+        "record": record,
+        "message": f"Restored the {updated['control_source']} offset and queued it for the next player request.",
     }
 
 
@@ -407,14 +623,53 @@ async def dashboard_edit_offset(cache_key: str, request: Request):
     }
 
 
-@app.post("/api/dashboard/offsets/{cache_key}/upload", include_in_schema=False)
-async def dashboard_upload_offset(cache_key: str, request: Request):
+@app.post("/api/dashboard/offsets/{cache_key}/restore", include_in_schema=False)
+async def dashboard_restore_offset(cache_key: str, request: Request):
     _require_admin(request)
     try:
-        status = await offsets.upload(cache_key)
+        record = await offsets.restore_automatic(cache_key)
+    except KeyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    active_players = playbacks.restore_for_cache(cache_key)
+    return {
+        "ok": True,
+        "record": record,
+        "active_players_updated": active_players,
+        "message": "Restored the original automatic offset.",
+    }
+
+
+@app.post("/api/dashboard/offsets/{cache_key}/upload", include_in_schema=False)
+async def dashboard_upload_offset(cache_key: str, request: Request,
+                                  playback_id: str | None = None):
+    _require_admin(request)
+    selected_result = None
+    if playback_id:
+        player = playbacks.get(playback_id)
+        if not player:
+            raise HTTPException(status_code=404, detail="playback not found")
+        if player.get("cache_key") != cache_key:
+            raise HTTPException(status_code=409, detail="playback does not use this offset record")
+        source = str(player.get("control_source") or "request")
+        candidate = (player.get("offset_candidates") or {}).get(source) or {}
+        selected_result = dict(candidate.get("result") or candidate)
+        selected_result.update({
+            "status": "ok",
+            "offset": float(player.get("current_offset") or 0.0),
+            "rate": float(player.get("current_rate") or 1.0),
+            "cached": source == "cached",
+            "custom": source == "manual",
+            "selected_for_upload": source,
+        })
+    try:
+        context = playbacks.context_for_cache(cache_key)
+        status = await offsets.upload(cache_key, context, selected_result)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    playbacks.note("remote-upload", cache_key=cache_key, status=status)
+    playbacks.note(
+        "remote-upload", cache_key=cache_key, playback_id=playback_id,
+        selected_source=(selected_result or {}).get("selected_for_upload"), status=status,
+    )
     if not status.get("remote_uploaded"):
         raise HTTPException(status_code=502, detail=status)
     return {"ok": True, "storage": status}

@@ -13,15 +13,18 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
+from activity import logged_http_request
 from security import valid_public_url
 
 
 class AudioStore:
-    def __init__(self, root: str, proxy: str = "", max_bytes: int = 10 * 1024**3):
+    def __init__(self, root: str, proxy: str = "", max_bytes: int = 10 * 1024**3,
+                 activity=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.proxy = proxy.strip()
         self.max_bytes = max_bytes
+        self.activity = activity
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _lock(self, hid: str):
@@ -152,18 +155,109 @@ class AudioStore:
             entries.append({"idx": index, "start": max(0.0, shifted / rate), "trim": trim, "duration": (float(duration) - trim) / rate})
         return entries
 
-    async def _download(self, url: str, headers: dict):
+    async def _download(self, url: str, headers: dict, redirects: int = 0):
         if not valid_public_url(url):
             raise ValueError("audio URL is not public HTTPS")
-        kwargs = {"timeout": 30, "follow_redirects": True}
+        if redirects > 5:
+            raise ValueError("too many audio redirects")
+        kwargs = {"timeout": 30, "follow_redirects": False}
         if self.proxy:
             kwargs["proxy"] = self.proxy
         async with httpx.AsyncClient(**kwargs) as client:
-            response = await client.get(url, headers=headers)
+            response = await logged_http_request(
+                self.activity, client, "GET", url, "audio-source", headers=headers
+            )
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location", "")
+                if not location:
+                    raise ValueError("audio redirect has no location")
+                return await self._download(urljoin(url, location), headers, redirects + 1)
             response.raise_for_status()
             if len(response.content) > 20 * 1024 * 1024:
                 raise ValueError("audio segment too large")
             return response.content
+
+    def inspect(self, hid: str) -> dict:
+        metadata = self.metadata(hid)
+        directory = self._dir(hid)
+        files = []
+        for path in sorted(directory.iterdir()):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            files.append({
+                "name": path.name,
+                "size": stat.st_size,
+                "modified_at": stat.st_mtime,
+                "kind": (
+                    "browser preview" if path.name.startswith("preview_s")
+                    else "alignment waveform" if path.name.startswith("align_")
+                    else "converted fragment" if path.suffix == ".m4s"
+                    else "initialization segment" if path.name.startswith("init_")
+                    else "encryption key" if path.name == "enc.key"
+                    else "metadata"
+                ),
+            })
+        segments = []
+        for index, (url, duration, start) in enumerate(zip(
+            metadata.get("segs") or [], metadata.get("durs") or [], metadata.get("starts") or []
+        )):
+            prefix = f"s{index}_"
+            converted = [item["name"] for item in files if item["name"].startswith(prefix)]
+            preview_name = f"preview_s{index}.wav"
+            segments.append({
+                "index": index,
+                "url": url,
+                "duration": duration,
+                "start": start,
+                "preview_cached": (directory / preview_name).exists(),
+                "converted_files": converted,
+            })
+        return {"hid": hid, "metadata": metadata, "files": files, "segments": segments}
+
+    async def preview(self, hid: str, index: int) -> Path:
+        metadata = self.metadata(hid)
+        segments = metadata.get("segs") or []
+        if index < 0 or index >= len(segments):
+            raise ValueError("audio segment index is out of range")
+        directory = self._dir(hid)
+        output = directory / f"preview_s{index}.wav"
+        if output.exists() and output.stat().st_size > 44:
+            return output
+        async with self._lock(f"preview:{hid}:{index}"):
+            if output.exists() and output.stat().st_size > 44:
+                return output
+            work = Path(tempfile.mkdtemp(prefix=f"preview-{index}-", dir=directory))
+            try:
+                source = await self._download(segments[index], metadata.get("headers") or {})
+                (work / "src.ts").write_bytes(source)
+                (work / "enc.key").write_bytes((directory / "enc.key").read_bytes())
+                iv = f",IV={metadata['iv']}" if metadata.get("iv") else ""
+                duration = float((metadata.get("durs") or [])[index])
+                (work / "input.m3u8").write_text(
+                    "#EXTM3U\n#EXT-X-VERSION:3\n"
+                    f"#EXT-X-TARGETDURATION:{int(duration) + 1}\n"
+                    f"#EXT-X-KEY:METHOD=AES-128,URI=\"enc.key\"{iv}\n"
+                    f"#EXTINF:{duration:.6f},\nsrc.ts\n#EXT-X-ENDLIST\n"
+                )
+                command = [
+                    "ffmpeg", "-v", "error", "-allowed_extensions", "ALL",
+                    "-protocol_whitelist", "file,crypto", "-i", "input.m3u8",
+                    "-vn", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+                    "-y", "preview.wav",
+                ]
+                process = await asyncio.create_subprocess_exec(
+                    *command, cwd=work, stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, error = await asyncio.wait_for(process.communicate(), timeout=60)
+                made = work / "preview.wav"
+                if process.returncode or not made.exists():
+                    raise RuntimeError((error.decode(errors="replace") or "ffmpeg failed")[:500])
+                shutil.copy2(made, output)
+                return output
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
 
     @staticmethod
     def _boxes(data: bytes, start=0, end=None):

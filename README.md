@@ -256,17 +256,41 @@ https://audio.example.com/dashboard
 ```
 
 Il token resta nella `sessionStorage` della scheda del browser e viene inviato
-solo come header Bearer. Playlist, chiavi, cookie, header di autorizzazione e
-query string firmate vengono esclusi dai metadati mostrati nella console.
+come header Bearer. La console e' una vista operatore completa: mostra URL con
+query string, playlist, body, cookie, header di autorizzazione, `vpsHost`,
+`vpsAccess` e gli altri valori ricevuti o inviati. Proteggi quindi il token e non
+rendere la console accessibile a persone non autorizzate.
 
 La console permette di:
 
 - vedere i playback recenti e distinguere cache hit locale, cache hit remota e
   nuova misurazione;
+- raggruppare nello stesso media le tracce audio, mostrandone chiaramente lingua,
+  HID, sessione e provenienza dell'offset;
 - correggere offset e rate con precisione millisecondo;
 - vedere quando la nuova revisione viene usata da una richiesta HLS;
+- scegliere di nuovo, dopo una modifica manuale, il valore cache DB, quello
+  calcolato dal sidecar o quello ricevuto nell'URL del player;
 - modificare record non piu' attivi nella libreria locale;
-- caricare esplicitamente un record modificato nel DB remoto.
+- caricare esplicitamente un record modificato nel DB remoto;
+- ispezionare ogni chiamata HTTP in ingresso e relativa risposta, oltre alle
+  chiamate in uscita verso media source, VPS e database;
+- seguire separatamente le decisioni interne del sidecar (prepare, cache,
+  misurazione, richieste player, edit, restore e upload);
+- riprodurre in browser segmenti audio decifrati, visualizzarne la waveform e
+  confrontare la waveform della traccia sostitutiva con l'audio video/reference.
+
+Gli aggiornamenti live usano una singola connessione Server-Sent Events. I
+dettagli completi di una transazione vengono letti solo quando apri la riga nel
+Traffic Inspector, quindi selezioni, link, tab e testo copiato non vengono
+rimpiazzati da polling periodico.
+
+Il journal HTTP e' conservato in `activity.db` dentro `SIDECAR_CACHE_DIR`. Il
+numero massimo di transazioni complete e' configurabile:
+
+```env
+SIDECAR_ACTIVITY_MAX_ROWS=5000
+```
 
 Quando salvi un offset su un playback attivo, il sidecar lo usa sulla successiva
 richiesta playlist/init/segmento. Non puo' svuotare il buffer gia' scaricato da
@@ -282,9 +306,19 @@ OFFSET_API_URL=https://YOUR_TOASTFLIX_HOST/dual/offset
 OFFSET_API_TOKEN=TOKEN_OPZIONALE_DEL_DB
 ```
 
-Il pulsante `Upload remote` e' disponibile solo quando `OFFSET_API_URL` e'
-configurato. Un errore remoto viene mostrato nella console senza perdere il
-record salvato localmente.
+Il pulsante `Upload` e' disponibile solo quando `OFFSET_API_URL` e'
+configurato oppure quando il record conserva un `vpsHost` ricevuto da ToastFlix.
+In quest'ultimo caso il sidecar usa automaticamente
+`<vpsHost>/dual/offset/report`, includendo il relativo `vpsAccess`. Un errore
+remoto viene mostrato nella console senza perdere il record salvato localmente.
+
+La console include anche il toggle persistente `Automatic DB uploads`. Quando e'
+su `Manual only`, i risultati della sincronizzazione vengono comunque salvati in
+`offsets.db`, ma il sidecar non invia alcun report automatico alla VPS/DB. Le
+lookup remote restano abilitate. L'amministratore puo' selezionare esplicitamente
+il valore cache, calcolato o manuale nel playback e premere `Upload selected`;
+quello e' il valore inviato in quel momento. La preferenza sopravvive ai riavvii
+quando `SIDECAR_CACHE_DIR` si trova su storage persistente.
 
 Il sidecar invia alla VPS solo metadati:
 

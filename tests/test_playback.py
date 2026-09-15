@@ -45,16 +45,60 @@ class PlaybackRegistryTests(unittest.TestCase):
         self.assertEqual(control["source"], "manual")
         self.assertFalse(self.registry.get(self.playback_id)["pending_player_request"])
 
-    def test_debug_metadata_redacts_secrets_and_signed_queries(self):
-        safe = safe_metadata({
+        restored = self.registry.restore_automatic(self.playback_id)
+        self.assertEqual(restored["current_offset"], 0.5)
+        self.assertEqual(restored["control_source"], "cached")
+
+    def test_debug_metadata_preserves_complete_values(self):
+        captured = safe_metadata({
             "video_url": "https://cdn.example.test/video.m3u8?token=secret",
             "vpsAccess": "private",
             "video_headers": {"Authorization": "Bearer private"},
         })
 
-        self.assertEqual(safe["video_url"], "https://cdn.example.test/video.m3u8")
-        self.assertEqual(safe["vpsAccess"], "[redacted]")
-        self.assertEqual(safe["video_headers"]["Authorization"], "[redacted]")
+        self.assertEqual(captured["video_url"], "https://cdn.example.test/video.m3u8?token=secret")
+        self.assertEqual(captured["vpsAccess"], "private")
+        self.assertEqual(captured["video_headers"]["Authorization"], "Bearer private")
+
+    def test_specific_cached_or_calculated_candidate_can_be_restored(self):
+        self.registry.bind(self.hid, self.token, {"cache_key": "cache-key"}, {
+            "status": "ok", "offset": 0.5, "rate": 1.0,
+            "cached": True, "cache_source": "remote",
+        })
+        self.registry.bind(self.hid, self.token, {"cache_key": "cache-key"}, {
+            "status": "ok", "offset": 0.25, "rate": 1.0, "cached": False,
+        })
+        self.registry.set_override(self.playback_id, -0.125, 1.0)
+
+        cached = self.registry.restore_automatic(self.playback_id, "cached")
+        self.assertEqual(cached["current_offset"], 0.5)
+        self.assertEqual(cached["control_source"], "cached")
+
+        calculated = self.registry.restore_automatic(self.playback_id, "calculated")
+        self.assertEqual(calculated["current_offset"], 0.25)
+        self.assertEqual(calculated["control_source"], "calculated")
+
+    def test_upload_context_can_come_from_prepare_request(self):
+        registry = PlaybackRegistry()
+        playback_id = registry.register(
+            "b" * 16,
+            self.token,
+            {"media_key": "series:tt13210838:2:8", "language": "eng"},
+            request_metadata={
+                "vpsHost": "https://offsets.example.test",
+                "vpsAccess": "complete-access-value",
+            },
+        )
+        registry.bind("b" * 16, self.token, {"cache_key": "prepared-context"}, {})
+
+        self.assertEqual(registry.get(playback_id)["cache_key"], "prepared-context")
+        self.assertEqual(registry.context_for_cache("prepared-context"), {
+            "vpsHost": "https://offsets.example.test",
+            "vpsAccess": "complete-access-value",
+            "provider": "",
+            "server": "",
+            "title": "",
+        })
 
 
 if __name__ == "__main__":

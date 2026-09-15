@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sidecar
+    name: sidecar-ui
     runtime: image
     plan: free
     image:
@@ -10,3 +10,5 @@ services:
         generateValue: true
       - key: SIDECAR_CACHE_DIR
         value: /app/data
+      - key: SIDECAR_ACTIVITY_MAX_ROWS
+        value: 5000
