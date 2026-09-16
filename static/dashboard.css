@@ -139,6 +139,10 @@ input:focus { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,91,33,
 .data-value a,.data-value code { min-width: 0; flex: 1; overflow: hidden; color: var(--blue); font: 10px ui-monospace,monospace; text-overflow: ellipsis; white-space: nowrap; }
 .data-value code { color: #c6c9cb; }
 .copy-button { flex: 0 0 auto; padding: 4px 6px; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 3px; font: 700 8px ui-monospace,monospace; cursor: pointer; }
+.copy-button:disabled { opacity: .4; cursor: not-allowed; }
+.data-edit-form input,.data-edit-form textarea { width: 100%; padding: 7px 8px; color: var(--ink); background: #0d0f10; border: 1px solid var(--line); border-radius: 3px; font: 10px ui-monospace,monospace; }
+.data-edit-form textarea { min-height: 72px; resize: vertical; }
+.data-edit-actions { display: flex; gap: 6px; margin-top: 6px; }
 .tabs { display: flex; gap: 2px; margin-top: 13px; border-bottom: 1px solid var(--line); }
 .tab-button { padding: 10px 11px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; font: 750 9px ui-monospace,monospace; text-transform: uppercase; letter-spacing: .07em; cursor: pointer; }
 .tab-button.selected { color: var(--ink); border-color: var(--orange); }

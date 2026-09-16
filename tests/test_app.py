@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -42,6 +43,52 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(denied.status_code, 401)
         self.assertEqual(allowed.status_code, 200)
         self.assertIn("players", allowed.json())
+
+    def test_dashboard_metadata_edit_supplies_missing_alignment_video_url(self):
+        hid = "e" * 16
+        playback_id = sidecar.playbacks.register(hid, "player-test-token", {
+            "media_key": "movie:missing-video", "language": "ita",
+        })
+        headers = {"Authorization": "Bearer admin-test-token"}
+        path = f"/api/dashboard/players/{playback_id}"
+        denied = self.client.patch(f"{path}/metadata", json={
+            "field": "video_url", "value": "https://video.example.test/movie.m3u8",
+        })
+        self.assertEqual(denied.status_code, 401)
+
+        edited = self.client.patch(f"{path}/metadata", headers=headers, json={
+            "field": "video_url", "value": "https://video.example.test/movie.m3u8",
+        })
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(
+            edited.json()["player"]["sync_metadata"]["video_url"],
+            "https://video.example.test/movie.m3u8",
+        )
+        sidecar.playbacks.bind(hid, "player-test-token", {"cache_key": "later-key"}, {})
+        self.assertEqual(
+            sidecar.playbacks.get(playback_id)["sync_metadata"]["video_url"],
+            "https://video.example.test/movie.m3u8",
+        )
+        audio_headers = {"Authorization": "Bearer sample"}
+        header_edit = self.client.patch(f"{path}/metadata", headers=headers, json={
+            "field": "audio_headers", "value": audio_headers,
+        })
+        self.assertEqual(header_edit.status_code, 200)
+
+        preview = Path(_cache.name) / "edited-video-preview.wav"
+        preview.write_bytes(b"RIFF" + b"\0" * 44)
+        with patch.object(sidecar.sync_engine, "manual_preview", new_callable=AsyncMock) as manual:
+            manual.return_value = preview
+            response = self.client.get(f"{path}/alignment/reference.wav", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(manual.await_args.args[0]["video_url"],
+                         "https://video.example.test/movie.m3u8")
+        self.assertEqual(manual.await_args.args[0]["audio_headers"], audio_headers)
+
+        rejected = self.client.patch(f"{path}/metadata", headers=headers, json={
+            "field": "video_headers", "value": "not JSON headers",
+        })
+        self.assertEqual(rejected.status_code, 400)
 
     def test_rejected_request_body_is_still_captured_in_full(self):
         response = self.client.patch(

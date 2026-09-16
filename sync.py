@@ -191,7 +191,8 @@ class SyncEngine:
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    async def _decode_audio(self, hid: str, position: float, directory: Path, sample_seconds: float = 5.0):
+    async def _decode_audio(self, hid: str, position: float, directory: Path,
+                            sample_seconds: float = 5.0, headers: dict | None = None):
         metadata = self.audio.metadata(hid)
         index = next((i for i, start in enumerate(metadata["starts"]) if start <= position < start + metadata["durs"][i]), len(metadata["segs"]) - 1)
         first = max(0, index - 1)
@@ -209,7 +210,8 @@ class SyncEngine:
         (directory / "audio.key").write_bytes((self.audio._dir(hid) / "enc.key").read_bytes())
         for number, item in enumerate(selected):
             name = f"audio-{number}.ts"
-            await self._download(metadata["segs"][item], directory / name, metadata.get("headers") or {})
+            await self._download(metadata["segs"][item], directory / name,
+                                 headers if headers is not None else metadata.get("headers") or {})
             lines += [f"#EXTINF:{metadata['durs'][item]:.6f},", name]
         lines.append("#EXT-X-ENDLIST")
         playlist = directory / "audio.m3u8"
@@ -257,11 +259,17 @@ class SyncEngine:
             raise ValueError("playback has no audio_hid")
         position = max(0.0, float(position))
         sample_seconds = min(20.0, max(2.0, float(sample_seconds)))
-        fingerprint = str(
-            payload.get("video_fingerprint") or payload.get("video_url") or "video"
+        video_headers = payload.get("video_headers")
+        audio_headers = payload.get("audio_headers")
+        source = (
+            str(payload.get("video_fingerprint") or ""),
+            str(payload.get("video_url") or ""),
+            str(payload.get("reference_audio_url") or ""),
+            repr(sorted(video_headers.items())) if isinstance(video_headers, dict) else "",
+            repr(sorted(audio_headers.items())) if isinstance(audio_headers, dict) else "",
         )
         preview_key = hashlib.sha1(
-            f"{kind}|{fingerprint}|{position:.3f}|{sample_seconds:.3f}".encode()
+            f"{kind}|{source}|{position:.3f}|{sample_seconds:.3f}".encode()
         ).hexdigest()[:12]
         output = self.audio._dir(audio_hid) / (
             f"align_{kind}_{int(round(position * 1000))}_{preview_key}.wav"
@@ -272,7 +280,8 @@ class SyncEngine:
             root = Path(directory)
             if kind == "replacement":
                 playlist, seek, _ = await self._decode_audio(
-                    audio_hid, position, root, sample_seconds=sample_seconds
+                    audio_hid, position, root, sample_seconds=sample_seconds,
+                    headers=audio_headers if isinstance(audio_headers, dict) else None,
                 )
             else:
                 video_headers = (

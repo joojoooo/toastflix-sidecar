@@ -126,12 +126,15 @@ class PlaybackRegistry:
         cache_hit = bool(result.get("cached")) if "cached" in result else None
         player.update({
             "updated_at": time.time(),
-            "cache_key": cache_key,
-            "resolution": payload.get("resolution"),
+            "cache_key": player.get("metadata_edits", {}).get("cache_key", cache_key),
+            "resolution": player.get("metadata_edits", {}).get("resolution", payload.get("resolution")),
             "cache_hit": cache_hit,
             "cache_source": cache_source,
             "sync_result": safe_metadata(result),
-            "sync_metadata": safe_metadata(payload),
+            "sync_metadata": {
+                **safe_metadata(payload),
+                **player.get("metadata_edits", {}),
+            },
         })
         if result.get("status", "ok") == "ok" and isinstance(result.get("offset"), (int, float)):
             candidate = {
@@ -259,6 +262,23 @@ class PlaybackRegistry:
         }
         player["updated_at"] = time.time()
         self._event("offset-cache-attached", playback_id, cache_key=cache_key)
+        return self._public_player(player)
+
+    def set_metadata_field(self, playback_id: str, field: str, value: str | int | dict) -> dict:
+        """Keep dashboard-supplied track metadata through later sync updates."""
+        player = self._players.get(playback_id)
+        if not player:
+            raise KeyError("playback not found")
+        edits = player.setdefault("metadata_edits", {})
+        edits[field] = safe_metadata(value)
+        player["sync_metadata"] = {
+            **(player.get("sync_metadata") or {}),
+            field: edits[field],
+        }
+        if field in {"cache_key", "resolution"}:
+            player[field] = value
+        player["updated_at"] = time.time()
+        self._event("playback-metadata-edited", playback_id, field=field)
         return self._public_player(player)
 
     def restore_automatic(self, playback_id: str, requested_source: str | None = None) -> dict:

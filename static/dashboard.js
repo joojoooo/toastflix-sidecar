@@ -435,11 +435,11 @@ function databaseLookupInfo(player) {
   return "Miss · waiting for automatic sync";
 }
 
-function makeField(label, value, link = false) {
+function makeField(label, value, link = false, edit = null) {
   const field = element("div", "data-field");
   field.append(element("span", "", label));
   const line = element("div", "data-value");
-  const text = String(value ?? "—");
+  const text = value === null || value === undefined || value === "" ? "—" : String(value);
   if (link && /^https?:\/\//i.test(text)) {
     const anchor = element("a", "", text);
     anchor.href = text; anchor.target = "_blank"; anchor.rel = "noreferrer";
@@ -447,10 +447,53 @@ function makeField(label, value, link = false) {
   } else {
     line.append(element("code", "", text));
   }
-  if (text !== "—") {
-    const copy = element("button", "copy-button", "Copy");
-    copy.type = "button"; copy.addEventListener("click", () => copyText(text));
-    line.append(copy);
+  const copy = element("button", "copy-button", "Copy");
+  copy.type = "button";
+  copy.disabled = text === "—";
+  copy.addEventListener("click", () => copyText(text));
+  line.append(copy);
+  if (edit) {
+    const button = element("button", "copy-button", "Edit");
+    button.type = "button";
+    button.addEventListener("click", () => {
+      const form = element("form", "data-edit-form");
+      const input = element(edit.json ? "textarea" : "input");
+      if (!edit.json) input.type = edit.key === "resolution" ? "number" : "text";
+      if (edit.key === "resolution") { input.min = "1"; input.max = "4320"; input.step = "1"; }
+      input.value = text === "—" ? (edit.json ? "{}" : "")
+        : edit.key === "resolution" ? text.replace(/p$/, "") : text;
+      input.setAttribute("aria-label", label);
+      input.required = true;
+      const actions = element("div", "data-edit-actions");
+      const save = element("button", "copy-button", "Save"); save.type = "submit";
+      const cancel = element("button", "copy-button", "Cancel"); cancel.type = "button";
+      cancel.addEventListener("click", () => form.replaceWith(line));
+      actions.append(save, cancel); form.append(input, actions);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        let nextValue = input.value.trim();
+        if (edit.json) {
+          try { nextValue = JSON.parse(nextValue); }
+          catch (_) { showNotice(`${label} must be valid JSON.`, true); return; }
+        }
+        save.disabled = true;
+        try {
+          const result = await api(`/api/dashboard/players/${encodeURIComponent(edit.playbackId)}/metadata`, {
+            method: "PATCH", body: JSON.stringify({ field: edit.key, value: nextValue }),
+          });
+          const index = currentState?.players?.findIndex((player) => player.playback_id === edit.playbackId) ?? -1;
+          if (index >= 0) {
+            currentState.players[index] = { ...currentState.players[index], ...result.player };
+            renderSessions(currentState.players);
+          }
+          if (form.isConnected) form.replaceWith(line);
+          showNotice(`${label} saved for this playback.`);
+        } catch (error) { showNotice(error.message, true); save.disabled = false; }
+      });
+      line.replaceWith(form);
+      input.focus(); input.select();
+    });
+    line.append(button);
   }
   field.append(line);
   return field;
@@ -522,7 +565,10 @@ function rawBlock(title, value) {
 function createAlignmentLab(player, offsetInput) {
   const lab = element("div", "tab-panel alignment");
   lab.append(element("h4", "", "Manual alignment lab"));
-  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. The offset slider moves both the orange waveform and its browser audio preview.");
+  const needsVideo = !metadataValue(player, "video_url", "videoUrl", "videoURL", "stream_url", "streamUrl")
+    && !metadataValue(player, "reference_audio_url", "referenceAudioUrl", "referenceAudio");
+  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. The offset slider moves both the orange waveform and its browser audio preview."
+    + (needsVideo ? " Add a Video URL in Links & credentials to load the blue waveform." : ""));
   const controls = element("div", "alignment-controls");
   const defaultPosition = player.sync_result?.measurements?.[0]?.position || 60;
   const position = numericField("Timeline position · seconds", Number(defaultPosition).toFixed(3), "0.001", "");
@@ -646,6 +692,12 @@ function createAlignmentLab(player, offsetInput) {
     audio.addEventListener("ended", redraw);
   });
   load.addEventListener("click", async () => {
+    if (needsVideo) {
+      const message = "Add a Video URL in Links & credentials, then load both waveforms.";
+      status.textContent = message;
+      showNotice(message);
+      return;
+    }
     load.disabled = true; status.textContent = "Downloading and decoding both samples…";
     const query = new URLSearchParams({ position: position.input.value, seconds: seconds.input.value });
     try {
@@ -720,15 +772,18 @@ function createNetworkPanel(player) {
   const audioMeta = player.audio_track?.metadata || player.audio_metadata || {};
   const fields = element("div", "data-grid");
   [
-    ["Video URL", metadataValue(player, "video_url", "videoUrl", "videoURL", "stream_url", "streamUrl"), true],
-    ["Reference audio URL", metadataValue(player, "reference_audio_url", "referenceAudioUrl", "referenceAudio"), true],
-    ["VPS host", metadataValue(player, "vpsHost", "vps_host"), true],
-    ["VPS access", metadataValue(player, "vpsAccess", "vps_access"), false],
-    ["Audio base URL", metadataValue(player, "base_url", "baseUrl") || audioMeta.base_url, true],
-    ["Provider", metadataValue(player, "provider"), false], ["Server", metadataValue(player, "server"), false],
-    ["Audio headers", jsonText(audioMeta.headers || metadataValue(player, "audio_headers", "audioHeaders") || {}), false],
-    ["Video headers", jsonText(metadataValue(player, "video_headers", "videoHeaders") || {}), false],
-  ].forEach(([label, value, link]) => { if (value !== undefined && value !== "") fields.append(makeField(label, value, link)); });
+    ["Video URL", metadataValue(player, "video_url", "videoUrl", "videoURL", "stream_url", "streamUrl"), true, "video_url"],
+    ["Reference audio URL", metadataValue(player, "reference_audio_url", "referenceAudioUrl", "referenceAudio"), true, "reference_audio_url"],
+    ["VPS host", metadataValue(player, "vpsHost", "vps_host"), true, "vpsHost"],
+    ["VPS access", metadataValue(player, "vpsAccess", "vps_access"), false, "vpsAccess"],
+    ["Audio base URL", metadataValue(player, "base_url", "baseUrl") || audioMeta.base_url, true, "base_url"],
+    ["Provider", metadataValue(player, "provider"), false, "provider"],
+    ["Server", metadataValue(player, "server"), false, "server"],
+    ["Audio headers", jsonText(player.metadata_edits?.audio_headers || audioMeta.headers || metadataValue(player, "audio_headers", "audioHeaders") || {}), false, "audio_headers", true],
+    ["Video headers", jsonText(metadataValue(player, "video_headers", "videoHeaders") || {}), false, "video_headers", true],
+  ].forEach(([label, value, link, key, json]) => {
+    fields.append(makeField(label, value, link, { playbackId: player.playback_id, key, json }));
+  });
   panel.append(fields);
   return panel;
 }
@@ -742,12 +797,13 @@ function createDetailsPanel(player, lang, source, registration) {
     ["Audio playlist setup", registration, false],
     ["Last HLS request type", player.last_request_kind || "None yet", false],
     ["Last offset received in an HLS request", player.request_count ? `${formatOffset(player.last_requested_offset)} s` : "No HLS request received yet", false],
-    ["Cache key", player.cache_key, false],
-    ["Video fingerprint", metadataValue(player, "video_fingerprint", "videoFingerprint"), false],
-    ["Audio fingerprint", metadataValue(player, "audio_fingerprint", "audioFingerprint", "source_fingerprint"), false],
-    ["Resolution", player.resolution ? `${player.resolution}p` : null, false],
-  ].forEach(([label, value, link]) => {
-    if (value !== null && value !== undefined && value !== "") fields.append(makeField(label, value, link));
+    ["Cache key", player.cache_key, false, "cache_key"],
+    ["Video fingerprint", metadataValue(player, "video_fingerprint", "videoFingerprint"), false, "video_fingerprint"],
+    ["Audio fingerprint", metadataValue(player, "audio_fingerprint", "audioFingerprint", "source_fingerprint"), false, "audio_fingerprint"],
+    ["Resolution", player.resolution ? `${player.resolution}p` : null, false, "resolution"],
+  ].forEach(([label, value, link, key]) => {
+    fields.append(makeField(label, value, link,
+      key ? { playbackId: player.playback_id, key } : null));
   });
   panel.append(fields);
   return panel;
@@ -901,7 +957,7 @@ function renderSessions(players) {
     player.playback_id, player.current_offset, player.current_rate, player.control_source,
     player.revision, player.applied_revision, player.cache_key, player.cache_hit,
     player.cache_source, player.active, player.ended_at, Boolean(player.request_count),
-    player.sync_result,
+    player.sync_result, player.sync_metadata, player.metadata_edits,
   ]));
   if (signature === sessionSignature) return;
   sessionSignature = signature;

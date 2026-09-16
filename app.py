@@ -3,6 +3,7 @@ import json
 import hmac
 import math
 import os
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -551,10 +552,16 @@ async def dashboard_alignment_preview(playback_id: str, kind: str, request: Requ
         **(player.get("prepare_request") or {}),
         **(player.get("sync_metadata") or {}),
     }
+    edits = player.get("metadata_edits") or {}
     payload["video_url"] = (
-        payload.get("video_url") or payload.get("videoUrl") or payload.get("videoURL") or ""
+        payload.get("video_url") or payload.get("videoUrl") or payload.get("videoURL")
+        or payload.get("stream_url") or payload.get("streamUrl") or ""
     )
-    payload["video_headers"] = payload.get("video_headers") or payload.get("videoHeaders") or {}
+    payload["video_headers"] = (
+        edits["video_headers"] if "video_headers" in edits
+        else payload.get("video_headers") or payload.get("videoHeaders") or {}
+    )
+    payload["audio_headers"] = edits.get("audio_headers")
     payload["reference_audio_url"] = (
         payload.get("reference_audio_url") or payload.get("referenceAudioUrl")
         or payload.get("referenceAudio") or ""
@@ -605,6 +612,46 @@ async def dashboard_edit_player(playback_id: str, request: Request):
             "Applied live in memory. Save it again after sync exposes a cache key to persist it."
         ),
     }
+
+
+@app.patch("/api/dashboard/players/{playback_id}/metadata", include_in_schema=False)
+async def dashboard_edit_player_metadata(playback_id: str, request: Request):
+    _require_admin(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="metadata edit must be an object")
+    field = body.get("field")
+    editable_fields = {
+        "video_url", "reference_audio_url", "vpsHost", "vpsAccess", "base_url",
+        "provider", "server", "video_fingerprint", "audio_fingerprint",
+        "video_headers", "audio_headers", "cache_key", "resolution",
+    }
+    if not isinstance(field, str) or field not in editable_fields:
+        raise HTTPException(status_code=400, detail="field cannot be edited")
+    value = body.get("value")
+    if field in {"video_headers", "audio_headers"}:
+        if (not isinstance(value, dict) or len(value) > 32
+                or any(not isinstance(key, str) or len(key) > 256
+                       or not re.fullmatch(r"[A-Za-z0-9-]+", key)
+                       or not isinstance(item, str) or len(item) > 4096
+                       or "\r" in item or "\n" in item
+                       for key, item in value.items())):
+            raise HTTPException(status_code=400, detail="headers must be a JSON object of strings")
+    elif field == "resolution":
+        value_text = str(value)
+        if (isinstance(value, bool) or len(value_text) > 10 or not value_text.isdigit()
+                or not 1 <= int(value_text) <= 4320):
+            raise HTTPException(status_code=400, detail="resolution must be between 1 and 4320")
+        value = int(value_text)
+    elif not isinstance(value, str) or not value.strip() or len(value) > 8192:
+        raise HTTPException(status_code=400, detail="value must be a nonempty string")
+    else:
+        value = value.strip()
+    try:
+        player = playbacks.set_metadata_field(playback_id, field, value)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "player": player, "message": f"Saved {field} for this playback."}
 
 
 @app.post("/api/dashboard/players/{playback_id}/offset/restore", include_in_schema=False)
