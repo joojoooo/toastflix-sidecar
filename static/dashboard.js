@@ -161,6 +161,51 @@ async function fetchAudio(path) {
   return { url, decoded };
 }
 
+function shiftedWav(buffer, shiftSeconds) {
+  const channels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const frameCount = buffer.length;
+  const bytesPerSample = 2;
+  const blockAlign = channels * bytesPerSample;
+  const dataLength = frameCount * blockAlign;
+  const wav = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(wav);
+  const writeText = (offset, value) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+  writeText(0, "RIFF"); view.setUint32(4, 36 + dataLength, true);
+  writeText(8, "WAVE"); writeText(12, "fmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true); view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true); view.setUint16(34, 16, true);
+  writeText(36, "data"); view.setUint32(40, dataLength, true);
+
+  const numericShift = Number(shiftSeconds);
+  const shiftFrames = Math.round((Number.isFinite(numericShift) ? numericShift : 0) * sampleRate);
+  const channelData = Array.from({ length: channels }, (_, channel) => buffer.getChannelData(channel));
+  let outputOffset = 44;
+  for (let outputFrame = 0; outputFrame < frameCount; outputFrame += 1) {
+    const sourceFrame = outputFrame - shiftFrames;
+    for (let channel = 0; channel < channels; channel += 1) {
+      const sample = sourceFrame >= 0 && sourceFrame < frameCount
+        ? Math.max(-1, Math.min(1, channelData[channel][sourceFrame]))
+        : 0;
+      view.setInt16(outputOffset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      outputOffset += bytesPerSample;
+    }
+  }
+  return new Blob([wav], { type: "audio/wav" });
+}
+
+function releaseObjectUrl(url) {
+  if (!url) return;
+  URL.revokeObjectURL(url);
+  objectUrls.delete(url);
+}
+
 function mediaLink(mediaKey) {
   const value = String(mediaKey || "");
   const imdb = value.match(/(?:^|:)(tt\d{5,})(?::|$)/i);
@@ -360,7 +405,7 @@ function rawBlock(title, value) {
 function createAlignmentLab(player, offsetInput) {
   const lab = element("div", "tab-panel alignment");
   lab.append(element("h4", "", "Manual alignment lab"));
-  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. Use the offset slider to move the orange waveform.");
+  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. The offset slider moves both the orange waveform and its browser audio preview.");
   const controls = element("div", "alignment-controls");
   const defaultPosition = player.sync_result?.measurements?.[0]?.position || 60;
   const position = numericField("Timeline position · seconds", Number(defaultPosition).toFixed(3), "0.001", "");
@@ -371,7 +416,7 @@ function createAlignmentLab(player, offsetInput) {
   const offsetSlider = element("div", "offset-slider-control");
   const sliderLabel = element("label");
   const sliderValue = element("strong", "", `${formatOffset(offsetInput.value)} s`);
-  sliderLabel.append("Visual offset", sliderValue);
+  sliderLabel.append("Preview offset", sliderValue);
   const slider = element("input");
   slider.type = "range"; slider.step = "0.001";
   const setSliderBounds = () => {
@@ -402,6 +447,10 @@ function createAlignmentLab(player, offsetInput) {
   const buffers = { reference: null, replacement: null };
   let cursorTime = 0;
   let animationFrame = null;
+  let shiftedReplacementUrl = "";
+  let replacementShiftTimer = null;
+  let replacementShiftVersion = 0;
+  let resumeReplacementAfterShift = false;
   const sampleSeconds = () => Math.max(0.001, Number(seconds.input.value) || 8);
   const redraw = () => {
     if (buffers.reference || buffers.replacement) {
@@ -417,6 +466,33 @@ function createAlignmentLab(player, offsetInput) {
       catch (_) { /* Media metadata may still be loading. */ }
     });
     redraw();
+  };
+  const applyReplacementOffset = () => {
+    if (!buffers.replacement) return;
+    clearTimeout(replacementShiftTimer);
+    replacementShiftTimer = null;
+    resumeReplacementAfterShift ||= !replacementAudio.paused;
+    const version = ++replacementShiftVersion;
+    const nextUrl = URL.createObjectURL(shiftedWav(buffers.replacement, offsetInput.value));
+    objectUrls.add(nextUrl);
+    const previousUrl = shiftedReplacementUrl;
+    shiftedReplacementUrl = nextUrl;
+    replacementAudio.addEventListener("loadedmetadata", () => {
+      if (version !== replacementShiftVersion) return;
+      seek(cursorTime);
+      if (resumeReplacementAfterShift) {
+        resumeReplacementAfterShift = false;
+        replacementAudio.play().catch(() => {});
+      }
+    }, { once: true });
+    replacementAudio.src = nextUrl;
+    replacementAudio.dataset.appliedOffset = String(Number(offsetInput.value) || 0);
+    releaseObjectUrl(previousUrl);
+  };
+  const queueReplacementOffset = () => {
+    if (!buffers.replacement) return;
+    clearTimeout(replacementShiftTimer);
+    replacementShiftTimer = setTimeout(applyReplacementOffset, 75);
   };
   const animateCursor = () => {
     cancelAnimationFrame(animationFrame);
@@ -460,20 +536,24 @@ function createAlignmentLab(player, offsetInput) {
         fetchAudio(`/api/dashboard/players/${encodeURIComponent(player.playback_id)}/alignment/reference.wav?${query}`),
         fetchAudio(`/api/dashboard/players/${encodeURIComponent(player.playback_id)}/alignment/replacement.wav?${query}`),
       ]);
-      referenceAudio.src = reference.url; replacementAudio.src = replacement.url;
+      referenceAudio.src = reference.url;
       buffers.reference = reference.decoded; buffers.replacement = replacement.decoded;
+      applyReplacementOffset();
+      releaseObjectUrl(replacement.url);
       seek(0);
-      status.textContent = "Loaded. Drag the cursor to seek, then slide the orange waveform until the events align.";
+      status.textContent = "Loaded. Drag the cursor to seek, then slide the orange waveform until the events align. The replacement player uses the same offset.";
     } catch (error) { status.textContent = error.message; showNotice(error.message, true); }
     finally { load.disabled = false; }
   });
   offsetInput.addEventListener("input", () => {
-    setSliderBounds(); redraw();
+    setSliderBounds(); redraw(); queueReplacementOffset();
   });
   slider.addEventListener("input", () => {
     offsetInput.value = Number(slider.value).toFixed(3);
     offsetInput.dispatchEvent(new Event("input"));
   });
+  slider.addEventListener("change", applyReplacementOffset);
+  offsetInput.addEventListener("change", applyReplacementOffset);
   seconds.input.addEventListener("input", redraw);
   lab.append(note, controls, offsetSlider, canvas, audioGrid, status);
   return lab;
