@@ -297,14 +297,22 @@ async def offset_lookup(request: Request):
     if isinstance(public_result, dict):
         public_result.pop("_cache_source", None)
     hid = str(body.get("audio_hid") or body.get("hid") or "")
-    if hid and result:
-        details = dict(result.get("details") or result)
-        details.pop("_cache_source", None)
-        details.update({
-            "cached": True,
-            "cache_source": cache_source or "unknown",
-            "cache_key": body.get("cache_key"),
-        })
+    if hid:
+        if result:
+            details = dict(result.get("details") or result)
+            details.pop("_cache_source", None)
+            details.update({
+                "cached": True,
+                "cache_source": cache_source or "unknown",
+                "cache_key": body.get("cache_key"),
+            })
+        else:
+            details = {
+                "status": "lookup-miss",
+                "cached": False,
+                "cache_source": None,
+                "cache_key": body.get("cache_key"),
+            }
         playbacks.bind(hid, token, body, details)
     return {
         "found": bool(result),
@@ -670,6 +678,25 @@ async def dashboard_restore_offset(cache_key: str, request: Request):
 async def dashboard_upload_offset(cache_key: str, request: Request,
                                   playback_id: str | None = None):
     _require_admin(request)
+    try:
+        raw_body = await request.body()
+        body = json.loads(raw_body) if raw_body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="upload details must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="upload details must be a JSON object")
+    supplied_context = {}
+    for name, alias in (("vpsHost", "vps_host"), ("vpsAccess", "vps_access")):
+        value = body.get(name, body.get(alias))
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"{name} must be a string")
+        value = value.strip()
+        if len(value) > 4096:
+            raise HTTPException(status_code=400, detail=f"{name} is too long")
+        if value:
+            supplied_context[name] = value
     selected_result = None
     if playback_id:
         player = playbacks.get(playback_id)
@@ -689,7 +716,7 @@ async def dashboard_upload_offset(cache_key: str, request: Request,
             "selected_for_upload": source,
         })
     try:
-        context = playbacks.context_for_cache(cache_key)
+        context = {**playbacks.context_for_cache(cache_key), **supplied_context}
         status = await offsets.upload(cache_key, context, selected_result)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -698,5 +725,11 @@ async def dashboard_upload_offset(cache_key: str, request: Request,
         selected_source=(selected_result or {}).get("selected_for_upload"), status=status,
     )
     if not status.get("remote_uploaded"):
+        if status.get("missing_fields"):
+            raise HTTPException(status_code=409, detail={
+                "code": "UPLOAD_CONTEXT_REQUIRED",
+                "message": status.get("remote_error") or "More upload details are required.",
+                "missing_fields": status["missing_fields"],
+            })
         raise HTTPException(status_code=502, detail=status)
     return {"ok": True, "storage": status}

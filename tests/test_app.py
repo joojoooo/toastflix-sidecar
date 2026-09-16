@@ -172,6 +172,74 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(custom_selection["offset"], -0.125)
         self.assertEqual(custom_selection["rate"], 0.9998)
 
+    def test_manual_upload_accepts_vps_details_entered_in_the_dashboard(self):
+        sidecar.playbacks.register(
+            "c" * 16,
+            "player-test-token",
+            {"media_key": "movie:previous", "language": "eng"},
+            request_metadata={"vpsHost": "https://previous.example.test"},
+        )
+        playback_id = sidecar.playbacks.register(
+            "d" * 16,
+            "player-test-token",
+            {"media_key": "movie:current", "language": "ita"},
+        )
+        lookup_payload = {
+            "token": "player-test-token",
+            "audio_hid": "d" * 16,
+            "cache_key": "prompted-cache-key",
+            "media_key": "movie:current",
+            "resolution": 1080,
+            "video_fingerprint": "video-fp",
+            "audio_fingerprint": "audio-fp",
+        }
+        with patch.object(sidecar.offsets, "lookup", new_callable=AsyncMock) as lookup:
+            lookup.return_value = None
+            lookup_response = self.client.post("/offset/lookup", json=lookup_payload)
+        self.assertEqual(lookup_response.status_code, 200)
+        self.assertFalse(lookup_response.json()["found"])
+        self.assertEqual(sidecar.playbacks.get(playback_id)["cache_key"], "prompted-cache-key")
+        sidecar.playbacks.set_override(playback_id, -0.225, 1.0)
+        uploaded = {
+            "local_saved": True,
+            "remote_configured": True,
+            "remote_uploaded": True,
+            "remote_status": 200,
+        }
+        with patch.object(sidecar.offsets, "upload", new_callable=AsyncMock) as upload:
+            upload.return_value = uploaded
+            response = self.client.post(
+                "/api/dashboard/offsets/prompted-cache-key/upload",
+                params={"playback_id": playback_id},
+                headers={"Authorization": "Bearer admin-test-token"},
+                json={"vpsAccess": "prompted-access"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(upload.await_args.args[1]["vpsHost"], "https://previous.example.test")
+        self.assertEqual(upload.await_args.args[1]["vpsAccess"], "prompted-access")
+        self.assertEqual(upload.await_args.args[2]["selected_for_upload"], "manual")
+        self.assertEqual(upload.await_args.args[2]["offset"], -0.225)
+
+    def test_manual_upload_identifies_details_needed_by_the_popup(self):
+        missing = {
+            "local_saved": True,
+            "remote_configured": False,
+            "remote_uploaded": False,
+            "missing_fields": ["vpsAccess"],
+            "remote_error": "Manual upload needs vpsAccess when OFFSET_API_URL is not configured",
+        }
+        with patch.object(sidecar.offsets, "upload", new_callable=AsyncMock) as upload:
+            upload.return_value = missing
+            response = self.client.post(
+                "/api/dashboard/offsets/missing-access-cache-key/upload",
+                headers={"Authorization": "Bearer admin-test-token"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["code"], "UPLOAD_CONTEXT_REQUIRED")
+        self.assertEqual(response.json()["detail"]["missing_fields"], ["vpsAccess"])
+
 
 if __name__ == "__main__":
     unittest.main()

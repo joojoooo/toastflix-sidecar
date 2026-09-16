@@ -306,11 +306,12 @@ OFFSET_API_URL=https://YOUR_TOASTFLIX_HOST/dual/offset
 OFFSET_API_TOKEN=TOKEN_OPZIONALE_DEL_DB
 ```
 
-Il pulsante `Upload` e' disponibile solo quando `OFFSET_API_URL` e'
-configurato oppure quando il record conserva un `vpsHost` ricevuto da ToastFlix.
-In quest'ultimo caso il sidecar usa automaticamente
-`<vpsHost>/dual/offset/report`, includendo il relativo `vpsAccess`. Un errore
-remoto viene mostrato nella console senza perdere il record salvato localmente.
+Il pulsante `Upload` usa `OFFSET_API_URL`, quando configurato, oppure il
+`vpsHost` ricevuto da ToastFlix. In quest'ultimo caso il sidecar chiama
+`<vpsHost>/dual/offset/report`, includendo il relativo `vpsAccess`. Se
+`vpsHost` o `vpsAccess` mancano, la console li richiede in un popup e li
+conserva con il record locale dopo l'upload. Un errore remoto viene mostrato
+nella console senza perdere il record salvato localmente.
 
 La console include anche il toggle persistente `Automatic DB uploads`. Quando e'
 su `Manual only`, i risultati della sincronizzazione vengono comunque salvati in

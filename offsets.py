@@ -332,12 +332,24 @@ class OffsetStore:
             },
         }
         dynamic_host = str(context.get("vpsHost") or "").strip().rstrip("/")
-        if not self.api_url and not dynamic_host:
+        dynamic_access = str(context.get("vpsAccess") or "").strip()
+        missing_fields = []
+        if not self.api_url:
+            if not dynamic_host:
+                missing_fields.append("vpsHost")
+            if not dynamic_access:
+                missing_fields.append("vpsAccess")
+        if missing_fields:
             return {
                 "local_saved": True,
-                "remote_configured": False,
+                "remote_configured": bool(dynamic_host),
                 "remote_uploaded": False,
-                "remote_error": "Neither OFFSET_API_URL nor an active playback vpsHost is available",
+                "missing_fields": missing_fields,
+                "remote_error": (
+                    "Manual upload needs "
+                    + " and ".join(missing_fields)
+                    + " when OFFSET_API_URL is not configured"
+                ),
             }
         payload = {
             "cache_key": record["cache_key"],

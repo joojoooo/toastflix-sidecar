@@ -157,6 +157,26 @@
     </div>
   </main>
 
+  <dialog id="upload-dialog" class="upload-dialog">
+    <form id="upload-form" method="dialog">
+      <p class="kicker">Remote offset database</p>
+      <h2>Complete the upload</h2>
+      <p id="upload-dialog-message" class="upload-dialog-message">Enter the missing connection details to upload this offset.</p>
+      <div id="upload-vps-host-field" class="upload-dialog-field">
+        <label for="upload-vps-host">VPS host</label>
+        <input id="upload-vps-host" type="url" inputmode="url" placeholder="https://toastflix.example.com" autocomplete="url">
+      </div>
+      <div id="upload-vps-access-field" class="upload-dialog-field">
+        <label for="upload-vps-access">VPS access</label>
+        <input id="upload-vps-access" type="password" autocomplete="off">
+      </div>
+      <div class="upload-dialog-actions">
+        <button class="button subtle" type="submit" value="cancel" formnovalidate>Cancel</button>
+        <button class="button primary" type="submit" value="upload">Upload selected value</button>
+      </div>
+    </form>
+  </dialog>
+
   <aside id="activity-drawer" class="drawer" aria-hidden="true">
     <div class="drawer-backdrop" data-close-drawer></div>
     <div class="drawer-panel">

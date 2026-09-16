@@ -18,6 +18,10 @@ const ui = {
   trafficFilters: document.querySelector("#traffic-filters"), notice: document.querySelector("#notice"),
   drawer: document.querySelector("#activity-drawer"), drawerTitle: document.querySelector("#drawer-title"),
   drawerContent: document.querySelector("#drawer-content"), copyTransaction: document.querySelector("#copy-transaction"),
+  uploadDialog: document.querySelector("#upload-dialog"),
+  uploadDialogMessage: document.querySelector("#upload-dialog-message"),
+  uploadHostField: document.querySelector("#upload-vps-host-field"), uploadHost: document.querySelector("#upload-vps-host"),
+  uploadAccessField: document.querySelector("#upload-vps-access-field"), uploadAccess: document.querySelector("#upload-vps-access"),
 };
 
 let token = sessionStorage.getItem("sidecar-admin-token") || "";
@@ -103,11 +107,42 @@ async function api(path, options = {}) {
   try { body = await response.json(); } catch (_) { body = {}; }
   if (!response.ok) {
     const detail = body.detail || body;
-    const error = new Error(typeof detail === "string" ? detail : jsonText(detail));
+    const error = new Error(typeof detail === "string" ? detail : detail.message || jsonText(detail));
     error.status = response.status;
+    error.detail = detail;
     throw error;
   }
   return body;
+}
+
+function requestUploadDetails(fields, defaults = {}) {
+  const missing = new Set(fields);
+  if (!missing.size) return Promise.resolve({});
+  if (ui.uploadDialog.open) return Promise.resolve(null);
+  const labels = [...missing].map((name) => name === "vpsHost" ? "VPS host" : "VPS access");
+  ui.uploadDialogMessage.textContent = `Enter the missing ${labels.join(" and ")} to upload this offset. The value will be retained with the local offset record for later uploads.`;
+  ui.uploadHostField.hidden = !missing.has("vpsHost");
+  ui.uploadHost.required = missing.has("vpsHost");
+  ui.uploadHost.value = missing.has("vpsHost") ? String(defaults.vpsHost || "") : "";
+  ui.uploadAccessField.hidden = !missing.has("vpsAccess");
+  ui.uploadAccess.required = missing.has("vpsAccess");
+  ui.uploadAccess.value = missing.has("vpsAccess") ? String(defaults.vpsAccess || "") : "";
+  ui.uploadDialog.returnValue = "cancel";
+  return new Promise((resolve) => {
+    ui.uploadDialog.addEventListener("close", () => {
+      const access = ui.uploadAccess.value.trim();
+      ui.uploadAccess.value = "";
+      if (ui.uploadDialog.returnValue !== "upload") { resolve(null); return; }
+      const result = {};
+      if (missing.has("vpsHost")) result.vpsHost = ui.uploadHost.value.trim();
+      if (missing.has("vpsAccess")) result.vpsAccess = access;
+      resolve(result);
+    }, { once: true });
+    ui.uploadDialog.showModal();
+    requestAnimationFrame(() => {
+      (missing.has("vpsHost") ? ui.uploadHost : ui.uploadAccess).focus();
+    });
+  });
 }
 
 async function fetchAudio(path) {
@@ -600,14 +635,17 @@ function createTrack(player) {
   );
   const fallbackHost = currentState?.server?.fallback_vps_host;
   const currentHost = metadataValue(player, "vpsHost", "vps_host");
+  const currentAccess = metadataValue(player, "vpsAccess", "vps_access");
   const hasDestination = Boolean(
     currentState?.server?.remote_db_configured || currentHost || fallbackHost
   );
-  upload.type = "button"; upload.disabled = !player.cache_key || !hasDestination;
+  upload.type = "button"; upload.disabled = !player.cache_key;
   upload.title = hasDestination
     ? `Upload the currently used ${player.control_source} value using ${currentState?.server?.remote_db_configured ? "the configured OFFSET_API_URL" : currentHost ? "this playback's vpsHost" : "the previous playback's vpsHost"}`
-    : "No OFFSET_API_URL or current/previous playback vpsHost is available";
-  upload.addEventListener("click", () => uploadOffset(player.cache_key, player.playback_id));
+    : "Upload the currently used value; missing VPS connection details will be requested";
+  upload.addEventListener("click", () => uploadOffset(player.cache_key, player.playback_id, {
+    vpsHost: currentHost || fallbackHost || "", vpsAccess: currentAccess || "",
+  }));
   actions.append(save, upload);
   const applyState = element("p", `apply-state ${player.pending_player_request ? "pending" : ""}`,
     player.pending_player_request
@@ -729,11 +767,11 @@ function renderOffsets(records) {
     restore.addEventListener("click", () => restoreOffset(record.cache_key));
     const upload = element("button", "button subtle compact", "Upload");
     const canUpload = Boolean(currentState?.server?.remote_db_configured || record.upload_context?.vpsHost);
-    upload.type = "button"; upload.disabled = !canUpload;
+    upload.type = "button";
     upload.title = currentState?.server?.remote_db_configured
       ? `Upload to ${currentState.server.configured_offset_api_url}`
-      : record.upload_context?.vpsHost ? `Upload through ${record.upload_context.vpsHost}` : "No upload destination";
-    upload.addEventListener("click", () => uploadOffset(record.cache_key));
+      : canUpload ? `Upload through ${record.upload_context.vpsHost}` : "Upload; missing VPS connection details will be requested";
+    upload.addEventListener("click", () => uploadOffset(record.cache_key, "", record.upload_context || {}));
     const inspect = element("button", "button subtle compact", "Inspect JSON");
     inspect.type = "button"; inspect.addEventListener("click", () => openJsonDrawer(
       `Offset · ${record.cache_key}`, "Complete offset record", record
@@ -914,13 +952,45 @@ async function restoreOffset(cacheKey) {
   } catch (error) { showNotice(error.message, true); }
 }
 
-async function uploadOffset(cacheKey, playbackId = "") {
+async function uploadOffset(cacheKey, playbackId = "", knownContext = {}) {
   if (!cacheKey) return;
-  try {
-    const query = playbackId ? `?playback_id=${encodeURIComponent(playbackId)}` : "";
-    const result = await api(`/api/dashboard/offsets/${encodeURIComponent(cacheKey)}/upload${query}`, { method: "POST" });
-    showNotice(`Uploaded successfully (HTTP ${result.storage.remote_status}).`);
-  } catch (error) { showNotice(error.message, true); }
+  let suppliedContext = {};
+  if (!currentState?.server?.remote_db_configured) {
+    const missing = [];
+    if (!(knownContext.vpsHost || currentState?.server?.fallback_vps_host)) missing.push("vpsHost");
+    if (!(knownContext.vpsAccess || currentState?.server?.fallback_vps_access_available)) missing.push("vpsAccess");
+    if (missing.length) {
+      const entered = await requestUploadDetails(missing, {
+        vpsHost: knownContext.vpsHost || currentState?.server?.fallback_vps_host || "",
+        vpsAccess: knownContext.vpsAccess || "",
+      });
+      if (!entered) return;
+      suppliedContext = entered;
+    }
+  }
+  let serverPrompted = false;
+  while (true) {
+    try {
+      const query = playbackId ? `?playback_id=${encodeURIComponent(playbackId)}` : "";
+      const options = { method: "POST" };
+      if (Object.keys(suppliedContext).length) options.body = JSON.stringify(suppliedContext);
+      const result = await api(`/api/dashboard/offsets/${encodeURIComponent(cacheKey)}/upload${query}`, options);
+      showNotice(`Uploaded successfully (HTTP ${result.storage.remote_status}).`);
+      return;
+    } catch (error) {
+      const missing = error.detail?.code === "UPLOAD_CONTEXT_REQUIRED" && Array.isArray(error.detail.missing_fields)
+        ? error.detail.missing_fields : [];
+      if (missing.length && !serverPrompted) {
+        const entered = await requestUploadDetails(missing, { ...knownContext, ...suppliedContext });
+        if (!entered) return;
+        suppliedContext = { ...suppliedContext, ...entered };
+        serverPrompted = true;
+        continue;
+      }
+      showNotice(error.message, true);
+      return;
+    }
+  }
 }
 
 async function setAutomaticUpload(enabled) {

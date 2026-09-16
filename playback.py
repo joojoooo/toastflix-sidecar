@@ -164,6 +164,7 @@ class PlaybackRegistry:
                 player["revision"] += 1
         event_kind = (
             "offset-cache-hit" if result.get("cached")
+            else "offset-cache-miss" if result.get("status") == "lookup-miss"
             else "sync-complete" if result.get("status", "ok") == "ok"
             else "sync-error"
         )

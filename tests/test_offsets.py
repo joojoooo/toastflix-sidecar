@@ -83,6 +83,31 @@ class OffsetStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["remote_uploaded"])
         self.assertEqual(send.await_args.args[3], "https://vps.example/dual/offset/report")
         self.assertEqual(send.await_args.kwargs["json"]["access"], "complete-access-value")
+        stored = await self.store.get("cache-key")
+        self.assertEqual(stored["details"]["remote_context"]["vpsAccess"], "complete-access-value")
+
+    async def test_manual_upload_reports_missing_dynamic_vps_access(self):
+        await self.store.report(self.payload, {
+            "status": "ok", "offset": 0.5, "rate": 1.0, "confidence": 0.8,
+        })
+
+        with patch("offsets.logged_http_request", new_callable=AsyncMock) as send:
+            status = await self.store.upload("cache-key", {
+                "vpsHost": "https://vps.example",
+            })
+
+        send.assert_not_awaited()
+        self.assertFalse(status["remote_uploaded"])
+        self.assertEqual(status["missing_fields"], ["vpsAccess"])
+
+    async def test_manual_upload_reports_all_missing_dynamic_vps_details(self):
+        await self.store.report(self.payload, {
+            "status": "ok", "offset": 0.5, "rate": 1.0, "confidence": 0.8,
+        })
+
+        status = await self.store.upload("cache-key")
+
+        self.assertEqual(status["missing_fields"], ["vpsHost", "vpsAccess"])
 
     async def test_disabled_automatic_upload_is_persisted_and_manual_upload_still_works(self):
         await self.store.set_automatic_upload_enabled(False)

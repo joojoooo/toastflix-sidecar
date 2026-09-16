@@ -68,6 +68,13 @@ input:focus { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,91,33,
 .switch-control:has(input:disabled) { opacity: .45; cursor: wait; }
 .notice { position: sticky; top: 12px; z-index: 20; margin-bottom: 18px; padding: 13px 16px; color: #101111; background: var(--lime); border-radius: 5px; font-weight: 750; box-shadow: 0 15px 45px #000; }
 .notice.bad { color: white; background: #a8322d; }
+.upload-dialog { width: min(500px,calc(100% - 28px)); padding: 0; color: var(--ink); background: #111315; border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: 0 30px 110px #000; }
+.upload-dialog::backdrop { background: rgba(0,0,0,.76); backdrop-filter: blur(4px); }
+.upload-dialog form { padding: 26px; }
+.upload-dialog h2 { margin: 0; font: 500 32px Georgia,serif; letter-spacing: -.03em; }
+.upload-dialog-message { margin: 11px 0 21px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.upload-dialog-field { margin-top: 14px; }
+.upload-dialog-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 24px; }
 .section { margin-top: 52px; }
 .section-heading { display: flex; justify-content: space-between; align-items: end; gap: 30px; margin-bottom: 18px; }
 .section-heading.slim { align-items: center; }
