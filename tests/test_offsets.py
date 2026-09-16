@@ -83,7 +83,9 @@ class OffsetStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["remote_uploaded"])
         self.assertEqual(send.await_args.args[3], "https://vps.example/dual/offset/report")
         self.assertEqual(send.await_args.kwargs["json"]["access"], "complete-access-value")
-        self.assertNotIn("remote_context", send.await_args.kwargs["json"]["offset"])
+        self.assertEqual(send.await_args.kwargs["json"]["offset"], {
+            "status": "ok", "offset": 0.75, "rate": 1.0, "confidence": 0.8,
+        })
         stored = await self.store.get("cache-key")
         self.assertEqual(stored["details"]["remote_context"]["vpsAccess"], "complete-access-value")
 
@@ -119,15 +121,18 @@ class OffsetStoreTests(unittest.IsolatedAsyncioTestCase):
             send.return_value = response
             status = await self.store.upload_player_value(
                 {"cache_key": "remote-key", "vpsHost": "https://vps.example", "vpsAccess": "access"},
-                {"status": "ok", "offset": -0.125, "rate": 1.0, "selected_for_upload": "manual"},
+                {"status": "ok", "offset": -0.125, "rate": 1.0,
+                 "source": "dashboard edit", "custom": True,
+                 "selected_for_upload": "manual"},
             )
 
         self.assertTrue(status["remote_uploaded"])
         self.assertFalse(status["local_saved"])
         self.assertIsNone(await self.store.get("remote-key"))
         self.assertEqual(send.await_args.kwargs["json"]["cache_key"], "remote-key")
-        self.assertEqual(send.await_args.kwargs["json"]["offset"]["offset"], -0.125)
-        self.assertNotIn("remote_context", send.await_args.kwargs["json"]["offset"])
+        self.assertEqual(send.await_args.kwargs["json"]["offset"], {
+            "status": "ok", "offset": -0.125, "rate": 1.0,
+        })
 
     async def test_player_upload_does_not_save_or_mutate_on_remote_failure(self):
         response = httpx.Response(
@@ -199,8 +204,38 @@ class OffsetStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(manual["remote_uploaded"])
         sent_offset = send.await_args.kwargs["json"]["offset"]
-        self.assertEqual(sent_offset["offset"], 1.125)
-        self.assertEqual(sent_offset["selected_for_upload"], "manual")
+        self.assertEqual(sent_offset, {
+            "status": "ok", "offset": 1.125, "rate": 1.0, "confidence": 0.8,
+        })
+
+    async def test_automatic_report_uses_reference_sync_result_fields(self):
+        self.store.api_url = "https://vps.example/dual/offset"
+        result = {
+            "status": "ok", "offset": 0.25, "rate": 1.0, "confidence": 0.9,
+            "deviation": 0.01, "sync_mode": "fast", "video_duration": 120.0,
+            "audio_duration": 120.0,
+            "measurements": [{"position": 24.0, "lag": -0.25, "offset": -0.25,
+                              "correlation": 0.9, "duration": 5.0}],
+            "sync_algorithm": "v2", "cache_key": "cache-key",
+            "cached": False, "cache_source": None, "custom": True,
+            "manually_uploaded_at": 1234567890,
+            "manual_history": [{"note": "private"}],
+            "remote_context": {"vpsAccess": "secret"},
+        }
+        response = httpx.Response(
+            200, json={"ok": True},
+            request=httpx.Request("POST", "https://vps.example/dual/offset/report"),
+        )
+        with patch("offsets.logged_http_request", new_callable=AsyncMock) as send:
+            send.return_value = response
+            status = await self.store.report(self.payload, result)
+
+        self.assertTrue(status["remote_uploaded"])
+        expected = {name: value for name, value in result.items() if name not in {
+            "cached", "cache_source", "custom", "manually_uploaded_at",
+            "manual_history", "remote_context",
+        }}
+        self.assertEqual(send.await_args.kwargs["json"], {**self.payload, "offset": expected})
 
 
 if __name__ == "__main__":
