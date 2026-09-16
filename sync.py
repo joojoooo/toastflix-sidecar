@@ -77,6 +77,37 @@ class SyncEngine:
         response = await self._get(url, headers)
         return self._playlist(response.text, url)
 
+    async def reference_audio_url(self, video_url: str, headers: dict) -> str | None:
+        """Find the default audio rendition advertised by an HLS master playlist."""
+        response = await self._get(video_url, headers)
+        renditions = []
+        stream_groups = []
+        for line in response.text.splitlines():
+            if line.startswith("#EXT-X-STREAM-INF:"):
+                match = re.search(r'(?:^|[:,])AUDIO="([^"]+)"', line)
+                if match:
+                    stream_groups.append(match.group(1))
+                continue
+            if not line.startswith("#EXT-X-MEDIA:"):
+                continue
+            attributes = dict(re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line))
+            if attributes.get("TYPE") != "AUDIO" or not attributes.get("URI"):
+                continue
+            uri = attributes["URI"].strip('"')
+            candidate = urljoin(str(response.url), uri)
+            if valid_public_url(candidate):
+                renditions.append((
+                    attributes.get("GROUP-ID", "").strip('"'),
+                    attributes.get("DEFAULT") == "YES", candidate,
+                ))
+        if not renditions:
+            return None
+        if stream_groups:
+            renditions = [item for item in renditions if item[0] == stream_groups[0]]
+            if not renditions:
+                return None
+        return next((url for _, default, url in renditions if default), renditions[0][2])
+
     async def _vidfast_sample_url(self, url: str, headers: dict,
                                   duration: float, provider: str) -> str:
         """Use a lighter rendition (480p) for sync when its timeline matches."""

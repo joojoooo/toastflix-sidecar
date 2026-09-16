@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from audio import AudioStore
 from sync import SyncEngine
 
@@ -50,6 +52,36 @@ class FakeOffsets:
 
 
 class SyncPlaylistTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reference_audio_url_uses_default_hls_rendition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = SyncEngine(FakeAudio(Path(directory)), FakeOffsets())
+            master = "https://video.example.test/master.m3u8"
+            playlist = """#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English, stereo",DEFAULT=NO,URI="alternate.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Italian",DEFAULT=YES,URI="tracks/italian.m3u8?token=abc"
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,AUDIO="audio"
+video.m3u8
+"""
+            engine._get = AsyncMock(return_value=httpx.Response(
+                200, text=playlist, request=httpx.Request("GET", master)
+            ))
+
+            found = await engine.reference_audio_url(master, {"Authorization": "Bearer test"})
+
+            self.assertEqual(found, "https://video.example.test/tracks/italian.m3u8?token=abc")
+            engine._get.assert_awaited_once_with(master, {"Authorization": "Bearer test"})
+
+    async def test_reference_audio_url_returns_none_for_media_playlist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = SyncEngine(FakeAudio(Path(directory)), FakeOffsets())
+            url = "https://video.example.test/video.m3u8"
+            engine._get = AsyncMock(return_value=httpx.Response(
+                200, text="#EXTM3U\n#EXTINF:4,\nsegment.ts\n",
+                request=httpx.Request("GET", url),
+            ))
+
+            self.assertIsNone(await engine.reference_audio_url(url, {}))
+
     async def test_manual_preview_keeps_requested_length_above_twenty_seconds(self):
         with tempfile.TemporaryDirectory() as directory:
             audio = FakeAudio(Path(directory))

@@ -479,7 +479,10 @@ function makeField(label, value, link = false, edit = null) {
         save.disabled = true;
         try {
           const result = await api(`/api/dashboard/players/${encodeURIComponent(edit.playbackId)}/metadata`, {
-            method: "PATCH", body: JSON.stringify({ field: edit.key, value: nextValue }),
+            method: "PATCH", body: JSON.stringify({
+              field: edit.key, value: nextValue,
+              discover_reference_audio: edit.key === "video_url",
+            }),
           });
           const index = currentState?.players?.findIndex((player) => player.playback_id === edit.playbackId) ?? -1;
           if (index >= 0) {
@@ -487,7 +490,7 @@ function makeField(label, value, link = false, edit = null) {
             renderSessions(currentState.players);
           }
           if (form.isConnected) form.replaceWith(line);
-          showNotice(`${label} saved for this playback.`);
+          showNotice(result.message);
         } catch (error) { showNotice(error.message, true); save.disabled = false; }
       });
       line.replaceWith(form);

@@ -279,7 +279,9 @@ La console permette di:
   misurazione, richieste player, edit, restore e upload);
 - inserire o correggere i metadati di una traccia dal pulsante Edit, anche
   quando ToastFlix non invia un campo come Video URL; le modifiche restano
-  disponibili finche' il playback rimane in memoria;
+  disponibili finche' il playback rimane in memoria. Quando modifichi Video URL,
+  la console cerca e salva anche la Reference audio URL se la playlist HLS
+  dichiara una traccia audio separata;
 - riprodurre in browser segmenti audio decifrati, visualizzarne la waveform e
   confrontare la waveform della traccia sostitutiva con l'audio video/reference.
 

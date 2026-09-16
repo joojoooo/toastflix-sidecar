@@ -90,6 +90,28 @@ class DashboardApiTests(unittest.TestCase):
         })
         self.assertEqual(rejected.status_code, 400)
 
+    def test_editing_video_url_discovers_reference_audio_url(self):
+        hid = "f" * 16
+        playback_id = sidecar.playbacks.register(hid, "player-test-token", {
+            "video_headers": {"Authorization": "Bearer source"},
+        })
+        path = f"/api/dashboard/players/{playback_id}/metadata"
+        video_url = "https://video.example.test/master.m3u8"
+        reference_url = "https://video.example.test/audio.m3u8"
+        with patch.object(sidecar.sync_engine, "reference_audio_url", new_callable=AsyncMock) as lookup:
+            lookup.return_value = reference_url
+            response = self.client.patch(path, headers={
+                "Authorization": "Bearer admin-test-token",
+            }, json={
+                "field": "video_url", "value": video_url,
+                "discover_reference_audio": True,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        lookup.assert_awaited_once_with(video_url, {"Authorization": "Bearer source"})
+        self.assertEqual(response.json()["player"]["sync_metadata"]["reference_audio_url"], reference_url)
+        self.assertEqual(sidecar.playbacks.get(playback_id)["metadata_edits"]["reference_audio_url"], reference_url)
+
     def test_rejected_request_body_is_still_captured_in_full(self):
         response = self.client.patch(
             "/api/dashboard/players/missing/offset",

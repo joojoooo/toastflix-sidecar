@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -651,7 +652,28 @@ async def dashboard_edit_player_metadata(playback_id: str, request: Request):
         player = playbacks.set_metadata_field(playback_id, field, value)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"ok": True, "player": player, "message": f"Saved {field} for this playback."}
+    message = f"Saved {field} for this playback."
+    if field == "video_url" and body.get("discover_reference_audio") is True:
+        metadata = {
+            **(player.get("prepare_request") or {}),
+            **(player.get("sync_metadata") or {}),
+        }
+        edits = player.get("metadata_edits") or {}
+        video_headers = (
+            edits["video_headers"] if "video_headers" in edits
+            else metadata.get("video_headers") or metadata.get("videoHeaders") or {}
+        )
+        try:
+            reference_url = await sync_engine.reference_audio_url(value, video_headers)
+        except (ValueError, RuntimeError, OSError, httpx.HTTPError) as exc:
+            message += f" Reference audio lookup failed: {exc}"
+        else:
+            if reference_url:
+                player = playbacks.set_metadata_field(playback_id, "reference_audio_url", reference_url)
+                message += " Reference audio URL found and saved."
+            else:
+                message += " No separate audio rendition was listed in the video playlist."
+    return {"ok": True, "player": player, "message": message}
 
 
 @app.post("/api/dashboard/players/{playback_id}/offset/restore", include_in_schema=False)
