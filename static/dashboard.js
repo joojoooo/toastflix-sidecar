@@ -508,40 +508,75 @@ function numericField(label, value, step, className) {
   return { wrapper, input };
 }
 
-function drawWaveform(canvas, buffers, seconds, shiftSeconds = 0, cursorSeconds = null) {
-  const ratio = window.devicePixelRatio || 1;
-  const width = Math.max(500, canvas.clientWidth * ratio);
-  const height = Math.max(100, canvas.clientHeight * ratio);
-  canvas.width = width; canvas.height = height;
-  const context = canvas.getContext("2d");
-  context.clearRect(0, 0, width, height);
-  context.fillStyle = "#070809"; context.fillRect(0, 0, width, height);
-  context.strokeStyle = "rgba(255,255,255,.1)"; context.beginPath();
-  context.moveTo(0, height / 2); context.lineTo(width, height / 2); context.stroke();
-  const render = (buffer, color, shift = 0) => {
-    if (!buffer) return;
-    const samples = buffer.getChannelData(0);
-    const visibleSamples = Math.min(samples.length, Math.floor(buffer.sampleRate * seconds));
-    const samplesPerPixel = Math.max(1, Math.floor(visibleSamples / width));
-    const xShift = Math.round((shift / seconds) * width);
-    context.strokeStyle = color; context.lineWidth = ratio; context.beginPath();
-    for (let x = 0; x < width; x += 1) {
-      const start = x * samplesPerPixel;
-      let min = 1; let max = -1;
-      for (let index = start; index < Math.min(start + samplesPerPixel, visibleSamples); index += 1) {
-        min = Math.min(min, samples[index]); max = Math.max(max, samples[index]);
-      }
-      const drawX = x + xShift;
-      if (drawX < 0 || drawX >= width) continue;
-      context.moveTo(drawX, (1 + min) * height / 2);
-      context.lineTo(drawX, (1 + max) * height / 2);
+function waveformPeaks(buffer) {
+  const samples = buffer.getChannelData(0);
+  const blockSize = 64;
+  const count = Math.ceil(samples.length / blockSize);
+  const low = new Float32Array(count);
+  const high = new Float32Array(count);
+  for (let block = 0; block < count; block += 1) {
+    let min = 1; let max = -1;
+    for (let index = block * blockSize; index < Math.min(samples.length, (block + 1) * blockSize); index += 1) {
+      min = Math.min(min, samples[index]); max = Math.max(max, samples[index]);
     }
-    context.stroke();
-  };
-  render(buffers.reference, "#8db6ff", 0);
-  render(buffers.replacement, "#ff5b21", shiftSeconds);
-  if (Number.isFinite(cursorSeconds)) {
-    const cursorX = Math.max(0, Math.min(width, (cursorSeconds / seconds) * width));
+    low[block] = min; high[block] = max;
+  }
+  return { blockSize, low, high };
+}
+
+function drawWaveform(canvas, buffers, peaks, viewStart, viewSeconds, shiftSeconds, cursorSeconds, cache) {
+  if (!canvas.clientWidth || !canvas.clientHeight) return;
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+  const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width; canvas.height = height;
+  }
+  const key = `${width}|${height}|${viewStart}|${viewSeconds}|${shiftSeconds}`;
+  if (cache.key !== key) {
+    const background = cache.canvas;
+    background.width = width; background.height = height;
+    const context = background.getContext("2d");
+    context.fillStyle = "#070809"; context.fillRect(0, 0, width, height);
+    context.strokeStyle = "rgba(255,255,255,.1)"; context.beginPath();
+    context.moveTo(0, height / 2); context.lineTo(width, height / 2); context.stroke();
+    const render = (buffer, envelope, color, shift) => {
+      if (!buffer) return;
+      const samples = buffer.getChannelData(0);
+      const { blockSize, low, high } = envelope;
+      const samplesPerPixel = buffer.sampleRate * viewSeconds / width;
+      const firstSample = (viewStart - shift) * buffer.sampleRate;
+      context.strokeStyle = color; context.lineWidth = ratio; context.beginPath();
+      for (let x = 0; x < width; x += 1) {
+        const start = Math.max(0, Math.floor(firstSample + x * samplesPerPixel));
+        const end = Math.min(samples.length, Math.ceil(firstSample + (x + 1) * samplesPerPixel));
+        if (end <= start) continue;
+        let min = 1; let max = -1;
+        const firstWhole = Math.ceil(start / blockSize) * blockSize;
+        const lastWhole = Math.floor(end / blockSize) * blockSize;
+        for (let index = start; index < Math.min(end, firstWhole); index += 1) {
+          min = Math.min(min, samples[index]); max = Math.max(max, samples[index]);
+        }
+        for (let index = firstWhole; index < lastWhole; index += blockSize) {
+          min = Math.min(min, low[index / blockSize]);
+          max = Math.max(max, high[index / blockSize]);
+        }
+        for (let index = Math.max(firstWhole, lastWhole); index < end; index += 1) {
+          min = Math.min(min, samples[index]); max = Math.max(max, samples[index]);
+        }
+        context.moveTo(x, (1 + min) * height / 2);
+        context.lineTo(x, (1 + max) * height / 2);
+      }
+      context.stroke();
+    };
+    render(buffers.reference, peaks.reference, "#8db6ff", 0);
+    render(buffers.replacement, peaks.replacement, "#ff5b21", shiftSeconds);
+    cache.key = key;
+  }
+  const context = canvas.getContext("2d");
+  context.drawImage(cache.canvas, 0, 0);
+  if (Number.isFinite(cursorSeconds) && cursorSeconds >= viewStart && cursorSeconds <= viewStart + viewSeconds) {
+    const cursorX = ((cursorSeconds - viewStart) / viewSeconds) * width;
     context.strokeStyle = "#f2efe8"; context.lineWidth = 1.5 * ratio;
     context.beginPath(); context.moveTo(cursorX, 0); context.lineTo(cursorX, height); context.stroke();
     context.fillStyle = "#f2efe8"; context.beginPath();
@@ -567,7 +602,7 @@ function createAlignmentLab(player, offsetInput) {
   lab.append(element("h4", "", "Manual alignment lab"));
   const needsVideo = !metadataValue(player, "video_url", "videoUrl", "videoURL", "stream_url", "streamUrl")
     && !metadataValue(player, "reference_audio_url", "referenceAudioUrl", "referenceAudio");
-  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. The offset slider moves both the orange waveform and its browser audio preview."
+  const note = element("p", "alignment-note", "Blue is the player/reference audio; orange is the replacement. Drag or tap the waveform to seek. Sample length is used when loading; use Waveform zoom to inspect the loaded sample. The offset slider moves both the orange waveform and its browser audio preview."
     + (needsVideo ? " Add a Video URL in Links & credentials to load the blue waveform." : ""));
   const controls = element("div", "alignment-controls");
   const defaultPosition = player.sync_result?.measurements?.[0]?.position || 60;
@@ -591,13 +626,23 @@ function createAlignmentLab(player, offsetInput) {
   };
   setSliderBounds();
   offsetSlider.append(sliderLabel, slider);
+  const zoomControl = element("div", "zoom-slider-control");
+  const zoomLabel = element("label");
+  const zoomValue = element("strong", "", "1.0×");
+  zoomLabel.append("Waveform zoom", zoomValue);
+  const zoomSlider = element("input");
+  zoomSlider.type = "range"; zoomSlider.min = "1"; zoomSlider.max = "16";
+  zoomSlider.step = "0.1"; zoomSlider.value = "1"; zoomSlider.disabled = true;
+  zoomSlider.setAttribute("aria-label", "Waveform zoom");
+  zoomControl.append(zoomLabel, zoomSlider);
   const canvas = element("canvas", "alignment-waveform");
   canvas.tabIndex = 0;
   canvas.setAttribute("role", "slider");
   canvas.setAttribute("aria-label", "Waveform playback cursor");
   canvas.setAttribute("aria-valuemin", "0");
-  canvas.setAttribute("aria-valuemax", seconds.input.value);
+  canvas.setAttribute("aria-valuemax", "0");
   canvas.setAttribute("aria-valuenow", "0");
+  canvas.setAttribute("aria-disabled", "true");
   canvas.title = "Tap or drag to seek both previews";
   const audioGrid = element("div", "alignment-audio");
   const referenceWrap = element("div"); referenceWrap.append(element("label", "", "Reference / player audio"));
@@ -608,25 +653,49 @@ function createAlignmentLab(player, offsetInput) {
   audioGrid.append(referenceWrap, replacementWrap);
   const status = element("p", "alignment-note", "No comparison loaded yet.");
   const buffers = { reference: null, replacement: null };
+  const peaks = { reference: null, replacement: null };
+  const waveformCache = { canvas: document.createElement("canvas"), key: null };
+  let loadedDuration = 0;
+  let viewStart = 0;
   let cursorTime = 0;
   let animationFrame = null;
   let shiftedReplacementUrl = "";
   let replacementShiftTimer = null;
   let replacementShiftVersion = 0;
   let resumeReplacementAfterShift = false;
-  const sampleSeconds = () => Math.max(0.001, Number(seconds.input.value) || 8);
-  const redraw = () => {
-    if (buffers.reference || buffers.replacement) {
-      drawWaveform(canvas, buffers, sampleSeconds(), Number(offsetInput.value), cursorTime);
+  const pendingSeeks = new WeakMap();
+  const visibleSeconds = () => loadedDuration / Number(zoomSlider.value);
+  const maxViewStart = () => Math.max(0, loadedDuration - visibleSeconds());
+  const clampViewStart = (value) => Math.max(0, Math.min(maxViewStart(), value));
+  const followCursor = () => {
+    if (cursorTime < viewStart) viewStart = clampViewStart(cursorTime);
+    else if (cursorTime > viewStart + visibleSeconds()) {
+      viewStart = clampViewStart(cursorTime - visibleSeconds());
     }
-    canvas.setAttribute("aria-valuemax", String(sampleSeconds()));
+  };
+  const redraw = () => {
+    if (loadedDuration) {
+      drawWaveform(canvas, buffers, peaks, viewStart, visibleSeconds(), Number(offsetInput.value) || 0, cursorTime, waveformCache);
+      zoomValue.textContent = `${Number(zoomSlider.value).toFixed(1)}× · ${viewStart.toFixed(1)}–${Math.min(loadedDuration, viewStart + visibleSeconds()).toFixed(1)} s`;
+    }
+    canvas.setAttribute("aria-valuemax", String(loadedDuration));
     canvas.setAttribute("aria-valuenow", String(cursorTime.toFixed(3)));
   };
   const seek = (value) => {
-    cursorTime = Math.max(0, Math.min(sampleSeconds(), Number(value) || 0));
+    if (!loadedDuration) return;
+    cursorTime = Math.max(0, Math.min(loadedDuration, Number(value) || 0));
+    followCursor();
     [referenceAudio, replacementAudio].forEach((audio) => {
-      try { audio.currentTime = Math.min(cursorTime, Number.isFinite(audio.duration) ? audio.duration : cursorTime); }
-      catch (_) { /* Media metadata may still be loading. */ }
+      try {
+        const audioTime = Math.min(cursorTime, Number.isFinite(audio.duration) ? audio.duration : cursorTime);
+        if (!Number.isFinite(audio.currentTime) || Math.abs(audio.currentTime - audioTime) > 0.001) {
+          pendingSeeks.set(audio, audioTime);
+          audio.currentTime = audioTime;
+        }
+      }
+      catch (_) {
+        pendingSeeks.delete(audio); // Media metadata may still be loading.
+      }
     });
     redraw();
   };
@@ -663,34 +732,51 @@ function createAlignmentLab(player, offsetInput) {
       const activeAudio = !referenceAudio.paused ? referenceAudio : !replacementAudio.paused ? replacementAudio : null;
       if (!activeAudio) { redraw(); return; }
       cursorTime = activeAudio.currentTime;
+      followCursor();
       redraw();
       animationFrame = requestAnimationFrame(tick);
     };
     animationFrame = requestAnimationFrame(tick);
   };
   const seekFromPointer = (event) => {
+    if (!loadedDuration) return;
     const bounds = canvas.getBoundingClientRect();
-    seek(((event.clientX - bounds.left) / bounds.width) * sampleSeconds());
+    seek(viewStart + ((event.clientX - bounds.left) / bounds.width) * visibleSeconds());
   };
   canvas.addEventListener("pointerdown", (event) => {
+    if (!loadedDuration) return;
     canvas.setPointerCapture(event.pointerId); seekFromPointer(event);
   });
   canvas.addEventListener("pointermove", (event) => {
     if (canvas.hasPointerCapture(event.pointerId)) seekFromPointer(event);
   });
   canvas.addEventListener("keydown", (event) => {
-    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    if (!loadedDuration || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
     if (event.key === "Home") seek(0);
-    else if (event.key === "End") seek(sampleSeconds());
+    else if (event.key === "End") seek(loadedDuration);
     else seek(cursorTime + (event.key === "ArrowRight" ? 0.1 : -0.1));
   });
   [referenceAudio, replacementAudio].forEach((audio) => {
     audio.addEventListener("play", animateCursor);
-    audio.addEventListener("seeking", () => { cursorTime = audio.currentTime; redraw(); });
+    audio.addEventListener("seeking", () => {
+      const expected = pendingSeeks.get(audio);
+      pendingSeeks.delete(audio);
+      if (expected !== undefined && (
+        Math.abs(audio.currentTime - expected) < 0.05
+        || (Number.isFinite(audio.duration) && expected > audio.duration
+          && Math.abs(audio.currentTime - audio.duration) < 0.05)
+      )) return;
+      cursorTime = audio.currentTime; followCursor(); redraw();
+    });
     audio.addEventListener("loadedmetadata", () => seek(cursorTime));
     audio.addEventListener("ended", redraw);
   });
+  zoomSlider.addEventListener("input", () => {
+    viewStart = clampViewStart(cursorTime - visibleSeconds() / 2);
+    redraw();
+  });
+  new ResizeObserver(redraw).observe(canvas);
   load.addEventListener("click", async () => {
     if (needsVideo) {
       const message = "Add a Video URL in Links & credentials, then load both waveforms.";
@@ -707,6 +793,13 @@ function createAlignmentLab(player, offsetInput) {
       ]);
       referenceAudio.src = reference.url;
       buffers.reference = reference.decoded; buffers.replacement = replacement.decoded;
+      peaks.reference = waveformPeaks(reference.decoded);
+      peaks.replacement = waveformPeaks(replacement.decoded);
+      loadedDuration = Math.max(reference.decoded.duration, replacement.decoded.duration);
+      viewStart = 0;
+      waveformCache.key = null;
+      zoomSlider.disabled = false;
+      canvas.setAttribute("aria-disabled", "false");
       applyReplacementOffset();
       releaseObjectUrl(replacement.url);
       seek(0);
@@ -723,8 +816,7 @@ function createAlignmentLab(player, offsetInput) {
   });
   slider.addEventListener("change", applyReplacementOffset);
   offsetInput.addEventListener("change", applyReplacementOffset);
-  seconds.input.addEventListener("input", redraw);
-  lab.append(note, controls, offsetSlider, canvas, audioGrid, status);
+  lab.append(note, controls, offsetSlider, zoomControl, canvas, audioGrid, status);
   return lab;
 }
 

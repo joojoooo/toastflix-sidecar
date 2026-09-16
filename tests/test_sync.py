@@ -50,6 +50,25 @@ class FakeOffsets:
 
 
 class SyncPlaylistTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_preview_keeps_requested_length_above_twenty_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio = FakeAudio(Path(directory))
+            engine = SyncEngine(audio, FakeOffsets())
+            playlist = Path(directory) / "source.m3u8"
+            engine._decode_audio = AsyncMock(return_value=(playlist, 0.0, 60.0))
+
+            async def write_preview(_playlist, _seek, output, _seconds):
+                output.write_bytes(b"RIFF" + b"\0" * 44)
+
+            engine._wav = AsyncMock(side_effect=write_preview)
+            output = await engine.manual_preview(
+                {"audio_hid": audio.hid}, "replacement", 0.0, 30.0
+            )
+
+            self.assertTrue(output.exists())
+            self.assertEqual(engine._decode_audio.await_args.kwargs["sample_seconds"], 30.0)
+            self.assertEqual(engine._wav.await_args.args[3], 30.0)
+
     def test_cached_audio_requires_fresh_signed_segments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

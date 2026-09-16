@@ -258,7 +258,7 @@ class SyncEngine:
         if not audio_hid:
             raise ValueError("playback has no audio_hid")
         position = max(0.0, float(position))
-        sample_seconds = min(20.0, max(2.0, float(sample_seconds)))
+        sample_seconds = min(30.0, max(1.0, float(sample_seconds)))
         video_headers = payload.get("video_headers")
         audio_headers = payload.get("audio_headers")
         source = (
