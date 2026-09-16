@@ -50,6 +50,22 @@ class PlaybackRegistryTests(unittest.TestCase):
         self.assertEqual(restored["current_offset"], 0.5)
         self.assertEqual(restored["control_source"], "cached")
 
+    def test_dashboard_can_attach_a_generated_cache_key(self):
+        attached = self.registry.attach_cache_key(self.playback_id, "generated-key", {
+            "cache_key": "generated-key",
+            "media_key": "movie:test:0:0",
+            "resolution": 1080,
+            "video_fingerprint": "video-fp",
+            "audio_fingerprint": "audio-fp",
+        })
+
+        self.assertEqual(attached["cache_key"], "generated-key")
+        self.assertEqual(attached["resolution"], 1080)
+        self.assertEqual(attached["sync_metadata"]["video_fingerprint"], "video-fp")
+        self.assertEqual(
+            self.registry.context_for_cache("generated-key")["provider"], ""
+        )
+
     def test_debug_metadata_preserves_complete_values(self):
         captured = safe_metadata({
             "video_url": "https://cdn.example.test/video.m3u8?token=secret",
@@ -124,6 +140,34 @@ class PlaybackRegistryTests(unittest.TestCase):
 
         self.assertEqual(context["vpsHost"], "https://previous.example.test")
         self.assertEqual(context["vpsAccess"], "previous-access")
+        self.assertEqual(
+            registry.context_for_playback(registry._playback_id("d" * 16, self.token))["vpsHost"],
+            "https://previous.example.test",
+        )
+
+    def test_upload_context_never_combines_credentials_from_different_sources(self):
+        registry = PlaybackRegistry()
+        playback_id = registry.register(
+            "e" * 16, self.token, {"media_key": "movie:test"},
+            request_metadata={
+                "vpsHost": "https://prepare.example.test", "vpsAccess": "prepare-access",
+            },
+        )
+        registry.bind("e" * 16, self.token, {
+            "vpsHost": "https://sync.example.test",
+        }, {})
+        context = registry.context_for_playback(playback_id)
+        self.assertEqual(context["vpsHost"], "https://prepare.example.test")
+        self.assertEqual(context["vpsAccess"], "prepare-access")
+
+        partials = PlaybackRegistry()
+        partials.register("f" * 16, self.token, {"media_key": "movie:first"},
+                          request_metadata={"vpsHost": "https://first.example.test"})
+        partial_id = partials.register("0" * 16, self.token, {"media_key": "movie:second"},
+                                       request_metadata={"vpsAccess": "unpaired-access"})
+        context = partials.context_for_playback(partial_id)
+        self.assertEqual(context["vpsHost"], "https://first.example.test")
+        self.assertFalse(context["vpsAccess"])
 
     def test_playback_remains_active_during_pause_grace_period(self):
         player = self.registry._players[self.playback_id]

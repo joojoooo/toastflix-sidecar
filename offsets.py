@@ -129,7 +129,11 @@ class OffsetStore:
 
     @classmethod
     def _remote_payload(cls, payload: dict) -> dict:
-        result = {name: payload[name] for name in cls.REMOTE_FIELDS if name in payload}
+        result = {
+            name: payload[name]
+            for name in cls.REMOTE_FIELDS
+            if name in payload and payload[name] not in (None, "")
+        }
         dynamic_access = payload.get("vpsAccess") or payload.get("vps_access")
         if dynamic_access:
             result["access"] = dynamic_access
@@ -147,6 +151,18 @@ class OffsetStore:
         if not result.get("vpsAccess") and payload.get("vps_access"):
             result["vpsAccess"] = payload["vps_access"]
         return result
+
+    @classmethod
+    def _remote_offset_result(cls, value):
+        """Keep local VPS credentials out of the offset object sent to the VPS."""
+        if isinstance(value, dict):
+            return {
+                name: cls._remote_offset_result(item)
+                for name, item in value.items() if name != "remote_context"
+            }
+        if isinstance(value, list):
+            return [cls._remote_offset_result(item) for item in value]
+        return value
 
     async def lookup(self, payload: dict):
         local_result = await asyncio.to_thread(self._local_get, payload["cache_key"])
@@ -229,7 +245,9 @@ class OffsetStore:
             return {"local_saved": True, "remote_configured": False, "remote_uploaded": False}
         try:
             headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
-            central_payload = {**self._remote_payload(payload), "offset": result}
+            central_payload = {
+                **self._remote_payload(payload), "offset": self._remote_offset_result(result),
+            }
             async with httpx.AsyncClient(timeout=8) as client:
                 response = await logged_http_request(
                     self.activity, client, "POST", f"{api_url}/report", "offset-db",
@@ -324,13 +342,18 @@ class OffsetStore:
         if not record:
             raise KeyError("offset record not found")
         stored_context = (record.get("details") or {}).get("remote_context") or {}
+        supplied = {
+            key: value for key, value in (context or {}).items()
+            if value not in (None, "")
+        }
         context = {
             **stored_context,
-            **{
-                key: value for key, value in (context or {}).items()
-                if value not in (None, "")
-            },
+            **supplied,
         }
+        if (supplied.get("vpsHost")
+                and supplied["vpsHost"].rstrip("/") != str(stored_context.get("vpsHost") or "").rstrip("/")
+                and not supplied.get("vpsAccess")):
+            context["vpsAccess"] = ""
         dynamic_host = str(context.get("vpsHost") or "").strip().rstrip("/")
         dynamic_access = str(context.get("vpsAccess") or "").strip()
         missing_fields = []
@@ -364,3 +387,89 @@ class OffsetStore:
             result.update(selected_result)
         result["manually_uploaded_at"] = time.time()
         return await self.report(payload, result, upload_remote=True)
+
+    async def upload_player_value(self, payload: dict, selected_result: dict):
+        """Send a playback value first; persist it locally only after a successful upload.
+
+        A canonical cache key can be attempted without the identity tuple. The
+        tuple is needed only to create a local SQLite record after the VPS accepts it.
+        """
+        cache_key = str(payload.get("cache_key") or "").strip()
+        if not cache_key:
+            raise KeyError("offset cache key required")
+        record = await self.get(cache_key)
+        result = dict((record or {}).get("details") or {})
+        if selected_result.get("custom"):
+            if record and not result.get("custom"):
+                result["automatic_result"] = dict(result)
+            history = list(result.get("manual_history") or [])
+            history.append({
+                "offset": float(selected_result["offset"]),
+                "rate": float(selected_result.get("rate", 1.0)),
+                "note": "dashboard upload",
+                "updated_at": time.time(),
+            })
+        result.update(selected_result)
+        if selected_result.get("custom"):
+            result["manual_history"] = history[-50:]
+        result["manually_uploaded_at"] = time.time()
+        context = self._remote_context(payload)
+        if context:
+            result["remote_context"] = context
+
+        dynamic_host = str(payload.get("vpsHost") or "").strip().rstrip("/")
+        dynamic_access = str(payload.get("vpsAccess") or "").strip()
+        missing = []
+        if not self.api_url:
+            if not dynamic_host:
+                missing.append("vpsHost")
+            if not dynamic_access:
+                missing.append("vpsAccess")
+        if missing:
+            return {
+                "local_saved": False, "remote_configured": bool(dynamic_host),
+                "remote_uploaded": False, "missing_fields": missing,
+                "remote_error": "Manual upload needs " + " and ".join(missing),
+            }
+
+        api_url = self.api_url or f"{dynamic_host}/dual/offset"
+        headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
+        central_payload = {
+            **self._remote_payload(payload), "offset": self._remote_offset_result(result),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                response = await logged_http_request(
+                    self.activity, client, "POST", f"{api_url}/report", "offset-db",
+                    json=central_payload, headers=headers,
+                )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            return {
+                "local_saved": False, "remote_configured": True,
+                "remote_uploaded": False, "remote_status": exc.response.status_code,
+                "remote_error": f"Remote report returned HTTP {exc.response.status_code}: {exc.response.text[:240]}",
+            }
+        except Exception as exc:
+            return {
+                "local_saved": False, "remote_configured": True,
+                "remote_uploaded": False,
+                "remote_error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+
+        required = ("media_key", "resolution", "video_fingerprint", "audio_fingerprint")
+        local_saved = all(payload.get(name) not in (None, "") for name in required)
+        local_error = None
+        if local_saved:
+            try:
+                await asyncio.to_thread(self._local_put, payload, result)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                local_saved = False
+                local_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+        status = {
+            "local_saved": local_saved, "remote_configured": True,
+            "remote_uploaded": True, "remote_status": response.status_code,
+        }
+        if local_error:
+            status["local_error"] = local_error
+        return status

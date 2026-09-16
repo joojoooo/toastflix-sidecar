@@ -313,6 +313,25 @@ Il pulsante `Upload` usa `OFFSET_API_URL`, quando configurato, oppure il
 conserva con il record locale dopo l'upload. Un errore remoto viene mostrato
 nella console senza perdere il record salvato localmente.
 
+Per un playback che ha solo l'offset nell'URL HLS, `Upload selected` apre un
+riepilogo dei campi necessari. Se ToastFlix ha inviato un `cache_key` esatto,
+il sidecar puo' tentare l'upload remoto usando solo quello. Senza cache key,
+servono `media_key`, risoluzione, fingerprint video e fingerprint audio: da
+questi quattro valori il sidecar genera la chiave. Media key e fingerprint
+audio sono normalmente gia' disponibili; la risoluzione puo' essere indicata
+dall'operatore, mentre il fingerprint video deve corrispondere esattamente a
+quello usato da ToastFlix. Il sidecar non lo calcola dall'URL HLS. Il popup
+mostra eventuali identita' di tracce precedenti come suggerimenti, da usare
+solo se l'edizione video e la sorgente audio sono davvero le stesse. Il record
+locale viene creato solo dopo un upload remoto riuscito e solo se tutti i
+quattro campi di identita' sono disponibili.
+
+Il fingerprint **audio** del sidecar e' SHA-1 dei path URL dei primi tre
+segmenti audio, separati da `|`, seguiti dal numero di segmenti; usa i primi
+20 caratteri esadecimali. Il fingerprint **video** non viene calcolato qui:
+ToastFlix deve inviare il valore esatto o una cache key gia' calcolata. Non
+basta indovinare la risoluzione per ricostruire un fingerprint video mancante.
+
 La console include anche il toggle persistente `Automatic DB uploads`. Quando e'
 su `Manual only`, i risultati della sincronizzazione vengono comunque salvati in
 `offsets.db`, ma il sidecar non invia alcun report automatico alla VPS/DB. Le

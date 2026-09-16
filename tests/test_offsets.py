@@ -83,6 +83,7 @@ class OffsetStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["remote_uploaded"])
         self.assertEqual(send.await_args.args[3], "https://vps.example/dual/offset/report")
         self.assertEqual(send.await_args.kwargs["json"]["access"], "complete-access-value")
+        self.assertNotIn("remote_context", send.await_args.kwargs["json"]["offset"])
         stored = await self.store.get("cache-key")
         self.assertEqual(stored["details"]["remote_context"]["vpsAccess"], "complete-access-value")
 
@@ -108,6 +109,59 @@ class OffsetStoreTests(unittest.IsolatedAsyncioTestCase):
         status = await self.store.upload("cache-key")
 
         self.assertEqual(status["missing_fields"], ["vpsHost", "vpsAccess"])
+
+    async def test_player_upload_accepts_key_only_without_creating_a_local_record(self):
+        response = httpx.Response(
+            200, json={"ok": True},
+            request=httpx.Request("POST", "https://vps.example/dual/offset/report"),
+        )
+        with patch("offsets.logged_http_request", new_callable=AsyncMock) as send:
+            send.return_value = response
+            status = await self.store.upload_player_value(
+                {"cache_key": "remote-key", "vpsHost": "https://vps.example", "vpsAccess": "access"},
+                {"status": "ok", "offset": -0.125, "rate": 1.0, "selected_for_upload": "manual"},
+            )
+
+        self.assertTrue(status["remote_uploaded"])
+        self.assertFalse(status["local_saved"])
+        self.assertIsNone(await self.store.get("remote-key"))
+        self.assertEqual(send.await_args.kwargs["json"]["cache_key"], "remote-key")
+        self.assertEqual(send.await_args.kwargs["json"]["offset"]["offset"], -0.125)
+        self.assertNotIn("remote_context", send.await_args.kwargs["json"]["offset"])
+
+    async def test_player_upload_does_not_save_or_mutate_on_remote_failure(self):
+        response = httpx.Response(
+            422, json={"error": "identity needed"},
+            request=httpx.Request("POST", "https://vps.example/dual/offset/report"),
+        )
+        with patch("offsets.logged_http_request", new_callable=AsyncMock) as send:
+            send.return_value = response
+            status = await self.store.upload_player_value(
+                {**self.payload, "vpsHost": "https://vps.example", "vpsAccess": "access"},
+                {"status": "ok", "offset": 0.25, "rate": 1.0, "custom": True},
+            )
+
+        self.assertFalse(status["remote_uploaded"])
+        self.assertEqual(status["remote_status"], 422)
+        self.assertIsNone(await self.store.get("cache-key"))
+
+    async def test_player_upload_saves_complete_identity_only_after_success(self):
+        response = httpx.Response(
+            200, json={"ok": True},
+            request=httpx.Request("POST", "https://vps.example/dual/offset/report"),
+        )
+        with patch("offsets.logged_http_request", new_callable=AsyncMock) as send:
+            send.return_value = response
+            status = await self.store.upload_player_value(
+                {**self.payload, "vpsHost": "https://vps.example", "vpsAccess": "access"},
+                {"status": "ok", "offset": 0.25, "rate": 1.0, "custom": True},
+            )
+
+        self.assertTrue(status["remote_uploaded"])
+        self.assertTrue(status["local_saved"])
+        record = await self.store.get("cache-key")
+        self.assertEqual(record["offset_seconds"], 0.25)
+        self.assertEqual(record["details"]["remote_context"]["vpsAccess"], "access")
 
     async def test_disabled_automatic_upload_is_persisted_and_manual_upload_still_works(self):
         await self.store.set_automatic_upload_enabled(False)

@@ -22,6 +22,24 @@ const ui = {
   uploadDialogMessage: document.querySelector("#upload-dialog-message"),
   uploadHostField: document.querySelector("#upload-vps-host-field"), uploadHost: document.querySelector("#upload-vps-host"),
   uploadAccessField: document.querySelector("#upload-vps-access-field"), uploadAccess: document.querySelector("#upload-vps-access"),
+  playerUploadDialog: document.querySelector("#player-upload-dialog"),
+  playerUploadSummary: document.querySelector("#player-upload-summary"),
+  playerUploadError: document.querySelector("#player-upload-error"),
+  playerUploadKey: document.querySelector("#player-upload-key"),
+  playerUploadKeyRule: document.querySelector("#player-upload-key-rule"),
+  playerUploadMedia: document.querySelector("#player-upload-media"),
+  playerUploadResolution: document.querySelector("#player-upload-resolution"),
+  playerUploadVideoFp: document.querySelector("#player-upload-video-fp"),
+  playerUploadAudioFp: document.querySelector("#player-upload-audio-fp"),
+  playerUploadIdentityRule: document.querySelector("#player-upload-identity-rule"),
+  playerUploadSuggestions: document.querySelector("#player-upload-suggestions"),
+  playerUploadHostField: document.querySelector("#player-upload-host-field"),
+  playerUploadHost: document.querySelector("#player-upload-host"),
+  playerUploadHostRule: document.querySelector("#player-upload-host-rule"),
+  playerUploadAccessField: document.querySelector("#player-upload-access-field"),
+  playerUploadAccess: document.querySelector("#player-upload-access"),
+  playerUploadAccessRule: document.querySelector("#player-upload-access-rule"),
+  playerUploadAccessHint: document.querySelector("#player-upload-access-hint"),
 };
 
 let token = sessionStorage.getItem("sidecar-admin-token") || "";
@@ -107,7 +125,7 @@ async function api(path, options = {}) {
   try { body = await response.json(); } catch (_) { body = {}; }
   if (!response.ok) {
     const detail = body.detail || body;
-    const error = new Error(typeof detail === "string" ? detail : detail.message || jsonText(detail));
+    const error = new Error(typeof detail === "string" ? detail : detail.message || detail.remote_error || jsonText(detail));
     error.status = response.status;
     error.detail = detail;
     throw error;
@@ -141,6 +159,105 @@ function requestUploadDetails(fields, defaults = {}) {
     ui.uploadDialog.showModal();
     requestAnimationFrame(() => {
       (missing.has("vpsHost") ? ui.uploadHost : ui.uploadAccess).focus();
+    });
+  });
+}
+
+function requestPlayerUploadDetails(info, previous = {}, errorMessage = "", forceIdentity = false) {
+  if (ui.playerUploadDialog.open) return Promise.resolve(null);
+  const identity = { ...info.identity, ...previous };
+  const fields = [
+    [ui.playerUploadMedia, "media_key"],
+    [ui.playerUploadResolution, "resolution"],
+    [ui.playerUploadVideoFp, "video_fingerprint"],
+    [ui.playerUploadAudioFp, "audio_fingerprint"],
+  ];
+  ui.playerUploadKey.value = previous.cache_key ?? info.cache_key ?? "";
+  ui.playerUploadKey.readOnly = info.local_record_found;
+  fields.forEach(([input, name]) => {
+    input.value = identity[name] ?? "";
+    input.readOnly = info.local_record_found;
+  });
+  const configured = info.connection.configured_api;
+  ui.playerUploadHostField.hidden = configured;
+  ui.playerUploadAccessField.hidden = configured;
+  ui.playerUploadHost.value = previous.vpsHost ?? info.connection.vpsHost ?? "";
+  ui.playerUploadAccess.value = "";
+  ui.playerUploadSummary.textContent = `Upload the selected ${formatOffset(info.selected_offset)} s (${info.selected_source}) value. Fields already known are prefilled; check guessed values against the same video edition.`;
+  ui.playerUploadError.textContent = errorMessage;
+  ui.playerUploadError.hidden = !errorMessage;
+  ui.playerUploadAccessHint.textContent = info.connection.vpsAccessAvailable
+    ? "Access is available on the server. Enter a replacement only if you change the host or the current access fails."
+    : "Required without a configured OFFSET_API_URL; this value is saved only after a successful upload with complete identity.";
+
+  const updateRules = () => {
+    const needsTuple = forceIdentity || !ui.playerUploadKey.value.trim();
+    fields.forEach(([input]) => { input.required = needsTuple; });
+    ui.playerUploadKeyRule.textContent = needsTuple ? "or generate from all four fields" : "known; identity fields optional";
+    ui.playerUploadIdentityRule.textContent = needsTuple
+      ? "All four identity fields are mandatory to generate the cache key. Resolution may be estimated, but the video fingerprint must be the exact ToastFlix value to target the right offset."
+      : "The exact cache key permits a remote attempt without the video URL or complete identity. Fill all four fields to save a local record too; the remote server may still reject a key-only report.";
+    const hostChanged = ui.playerUploadHost.value.trim().replace(/\/$/, "")
+      !== String(info.connection.vpsHost || "").replace(/\/$/, "");
+    ui.playerUploadHost.required = !configured;
+    ui.playerUploadAccess.required = !configured && (!info.connection.vpsAccessAvailable || hostChanged);
+    ui.playerUploadHostRule.textContent = configured ? "optional" : "required";
+    ui.playerUploadAccessRule.textContent = ui.playerUploadAccess.required ? "required" : "available on server";
+  };
+  ui.playerUploadKey.addEventListener("input", updateRules);
+  ui.playerUploadHost.addEventListener("input", updateRules);
+  updateRules();
+
+  const incompleteIdentity = fields.some(([input]) => !input.value.trim());
+  const suggestions = info.local_record_found || (!incompleteIdentity && !forceIdentity)
+    ? [] : info.suggestions || [];
+  ui.playerUploadSuggestions.hidden = !suggestions.length;
+  ui.playerUploadSuggestions.replaceChildren();
+  if (suggestions.length) {
+    ui.playerUploadSuggestions.append(
+      element("strong", "", "Possible identity from another track"),
+      element("p", "", "Use only if it is the same video edition and audio source. A wrong match can overwrite another offset."),
+    );
+    suggestions.forEach((candidate) => {
+      const button = element("button", "button subtle compact",
+        `${candidate.source} · ${candidate.resolution}p · video ${candidate.video_fingerprint} · audio ${candidate.audio_fingerprint}`);
+      button.type = "button";
+      button.addEventListener("click", () => {
+        ui.playerUploadKey.value = candidate.cache_key;
+        ui.playerUploadMedia.value = candidate.media_key;
+        ui.playerUploadResolution.value = candidate.resolution;
+        ui.playerUploadVideoFp.value = candidate.video_fingerprint;
+        ui.playerUploadAudioFp.value = candidate.audio_fingerprint;
+        updateRules();
+      });
+      ui.playerUploadSuggestions.append(button);
+    });
+  }
+
+  ui.playerUploadDialog.returnValue = "cancel";
+  return new Promise((resolve) => {
+    ui.playerUploadDialog.addEventListener("close", () => {
+      ui.playerUploadKey.removeEventListener("input", updateRules);
+      ui.playerUploadHost.removeEventListener("input", updateRules);
+      const access = ui.playerUploadAccess.value.trim();
+      ui.playerUploadAccess.value = "";
+      if (ui.playerUploadDialog.returnValue !== "upload") { resolve(null); return; }
+      const result = {
+        cache_key: ui.playerUploadKey.value.trim(),
+        media_key: ui.playerUploadMedia.value.trim(),
+        resolution: ui.playerUploadResolution.value.trim(),
+        video_fingerprint: ui.playerUploadVideoFp.value.trim(),
+        audio_fingerprint: ui.playerUploadAudioFp.value.trim(),
+      };
+      const host = ui.playerUploadHost.value.trim();
+      if (!configured && host !== info.connection.vpsHost) result.vpsHost = host;
+      if (access) result.vpsAccess = access;
+      resolve(result);
+    }, { once: true });
+    ui.playerUploadDialog.showModal();
+    requestAnimationFrame(() => {
+      const firstMissing = fields.find(([input]) => !input.value);
+      (firstMissing?.[0] || ui.playerUploadKey).focus();
     });
   });
 }
@@ -713,19 +830,9 @@ function createTrack(player) {
   const upload = element(
     "button", "button subtle", `Upload selected ${formatOffset(player.current_offset)}s`
   );
-  const fallbackHost = currentState?.server?.fallback_vps_host;
-  const currentHost = metadataValue(player, "vpsHost", "vps_host");
-  const currentAccess = metadataValue(player, "vpsAccess", "vps_access");
-  const hasDestination = Boolean(
-    currentState?.server?.remote_db_configured || currentHost || fallbackHost
-  );
-  upload.type = "button"; upload.disabled = !player.cache_key;
-  upload.title = hasDestination
-    ? `Upload the currently used ${player.control_source} value using ${currentState?.server?.remote_db_configured ? "the configured OFFSET_API_URL" : currentHost ? "this playback's vpsHost" : "the previous playback's vpsHost"}`
-    : "Upload the currently used value; missing VPS connection details will be requested";
-  upload.addEventListener("click", () => uploadOffset(player.cache_key, player.playback_id, {
-    vpsHost: currentHost || fallbackHost || "", vpsAccess: currentAccess || "",
-  }));
+  upload.type = "button";
+  upload.title = "Review the selected value, offset identity, and VPS destination before uploading; missing details will be requested";
+  upload.addEventListener("click", () => uploadPlayer(player.playback_id));
   actions.append(save, upload);
   const applyState = element("p", `apply-state ${player.pending_player_request ? "pending" : ""}`,
     player.pending_player_request
@@ -851,7 +958,7 @@ function renderOffsets(records) {
     upload.title = currentState?.server?.remote_db_configured
       ? `Upload to ${currentState.server.configured_offset_api_url}`
       : canUpload ? `Upload through ${record.upload_context.vpsHost}` : "Upload; missing VPS connection details will be requested";
-    upload.addEventListener("click", () => uploadOffset(record.cache_key, "", record.upload_context || {}));
+    upload.addEventListener("click", () => uploadOffset(record.cache_key));
     const inspect = element("button", "button subtle compact", "Inspect JSON");
     inspect.type = "button"; inspect.addEventListener("click", () => openJsonDrawer(
       `Offset · ${record.cache_key}`, "Complete offset record", record
@@ -1032,36 +1139,52 @@ async function restoreOffset(cacheKey) {
   } catch (error) { showNotice(error.message, true); }
 }
 
-async function uploadOffset(cacheKey, playbackId = "", knownContext = {}) {
-  if (!cacheKey) return;
-  let suppliedContext = {};
-  if (!currentState?.server?.remote_db_configured) {
-    const missing = [];
-    if (!(knownContext.vpsHost || currentState?.server?.fallback_vps_host)) missing.push("vpsHost");
-    if (!(knownContext.vpsAccess || currentState?.server?.fallback_vps_access_available)) missing.push("vpsAccess");
-    if (missing.length) {
-      const entered = await requestUploadDetails(missing, {
-        vpsHost: knownContext.vpsHost || currentState?.server?.fallback_vps_host || "",
-        vpsAccess: knownContext.vpsAccess || "",
-      });
-      if (!entered) return;
-      suppliedContext = entered;
+async function uploadPlayer(playbackId) {
+  const path = `/api/dashboard/players/${encodeURIComponent(playbackId)}/offset`;
+  let info;
+  try { info = await api(`${path}/upload-info`); }
+  catch (error) { showNotice(error.message, true); return; }
+  if (!info.offset_observed) {
+    showNotice("No HLS offset has been observed yet. Wait for playback or apply a manual offset first.", true);
+    return;
+  }
+  let previous = {};
+  let errorMessage = "";
+  let forceIdentity = false;
+  while (true) {
+    const entered = await requestPlayerUploadDetails(info, previous, errorMessage, forceIdentity);
+    if (!entered) return;
+    try {
+      const result = await api(`${path}/upload`, { method: "POST", body: JSON.stringify(entered) });
+      if (result.storage.local_saved) showNotice(`Uploaded successfully (HTTP ${result.storage.remote_status}) and saved locally.`);
+      else if (result.storage.local_error) showNotice(`Uploaded remotely (HTTP ${result.storage.remote_status}), but local save failed: ${result.storage.local_error}`, true);
+      else showNotice(`Uploaded using the cache key (HTTP ${result.storage.remote_status}). No local record was saved because identity fields are incomplete.`);
+      return;
+    } catch (error) {
+      if (error.status !== 409 && error.status !== 502) { showNotice(error.message, true); return; }
+      errorMessage = error.message;
+      forceIdentity = error.detail?.code === "UPLOAD_IDENTITY_REQUIRED";
+      previous = entered;
     }
   }
+}
+
+async function uploadOffset(cacheKey) {
+  if (!cacheKey) return;
+  let suppliedContext = {};
   let serverPrompted = false;
   while (true) {
     try {
-      const query = playbackId ? `?playback_id=${encodeURIComponent(playbackId)}` : "";
       const options = { method: "POST" };
       if (Object.keys(suppliedContext).length) options.body = JSON.stringify(suppliedContext);
-      const result = await api(`/api/dashboard/offsets/${encodeURIComponent(cacheKey)}/upload${query}`, options);
+      const result = await api(`/api/dashboard/offsets/${encodeURIComponent(cacheKey)}/upload`, options);
       showNotice(`Uploaded successfully (HTTP ${result.storage.remote_status}).`);
       return;
     } catch (error) {
       const missing = error.detail?.code === "UPLOAD_CONTEXT_REQUIRED" && Array.isArray(error.detail.missing_fields)
         ? error.detail.missing_fields : [];
       if (missing.length && !serverPrompted) {
-        const entered = await requestUploadDetails(missing, { ...knownContext, ...suppliedContext });
+        const entered = await requestUploadDetails(missing, suppliedContext);
         if (!entered) return;
         suppliedContext = { ...suppliedContext, ...entered };
         serverPrompted = true;

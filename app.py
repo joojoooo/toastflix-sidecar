@@ -674,10 +674,7 @@ async def dashboard_restore_offset(cache_key: str, request: Request):
     }
 
 
-@app.post("/api/dashboard/offsets/{cache_key}/upload", include_in_schema=False)
-async def dashboard_upload_offset(cache_key: str, request: Request,
-                                  playback_id: str | None = None):
-    _require_admin(request)
+async def _dashboard_upload_body(request: Request) -> dict:
     try:
         raw_body = await request.body()
         body = json.loads(raw_body) if raw_body else {}
@@ -685,6 +682,10 @@ async def dashboard_upload_offset(cache_key: str, request: Request,
         raise HTTPException(status_code=400, detail="upload details must be valid JSON") from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="upload details must be a JSON object")
+    return body
+
+
+def _dashboard_upload_context(body: dict) -> dict:
     supplied_context = {}
     for name, alias in (("vpsHost", "vps_host"), ("vpsAccess", "vps_access")):
         value = body.get(name, body.get(alias))
@@ -697,6 +698,248 @@ async def dashboard_upload_offset(cache_key: str, request: Request,
             raise HTTPException(status_code=400, detail=f"{name} is too long")
         if value:
             supplied_context[name] = value
+    return supplied_context
+
+
+def _selected_player_offset(player: dict) -> dict:
+    source = str(player.get("control_source") or "request")
+    candidate = (player.get("offset_candidates") or {}).get(source) or {}
+    selected = dict(candidate.get("result") or candidate)
+    selected.update({
+        "status": "ok",
+        "offset": float(player.get("current_offset") or 0.0),
+        "rate": float(player.get("current_rate") or 1.0),
+        "cached": source == "cached",
+        "custom": source == "manual",
+        "selected_for_upload": source,
+    })
+    return selected
+
+
+def _player_offset_identity(player: dict) -> tuple[dict, list[str]]:
+    sources = (
+        player.get("sync_metadata") or {},
+        player.get("prepare_request") or {},
+        player,
+        player.get("audio_metadata") or {},
+    )
+
+    def first(*names):
+        for source in sources:
+            for name in names:
+                if source.get(name) not in (None, ""):
+                    return source[name]
+        return None
+
+    raw_resolution = first("resolution")
+    try:
+        resolution = int(raw_resolution) if raw_resolution not in (None, "") else None
+    except (TypeError, ValueError):
+        resolution = None
+    identity = {
+        "media_key": str(first("media_key", "mediaKey") or ""),
+        "resolution": resolution,
+        "video_fingerprint": str(first("video_fingerprint", "videoFingerprint") or ""),
+        "audio_fingerprint": str(
+            first("audio_fingerprint", "audioFingerprint", "source_fingerprint") or ""
+        ),
+    }
+    missing = [name for name, value in identity.items() if value in (None, "")]
+    for name in ("provider", "server", "title"):
+        value = first(name)
+        if value not in (None, ""):
+            identity[name] = value
+    return identity, missing
+
+
+async def _player_upload_info(player: dict) -> tuple[dict, dict | None, dict]:
+    cache_key = str(player.get("cache_key") or "").strip()
+    record = await offsets.get(cache_key) if cache_key else None
+    identity, _ = _player_offset_identity(player)
+    if record:
+        identity.update({
+            name: record[name]
+            for name in ("media_key", "resolution", "video_fingerprint", "audio_fingerprint")
+        })
+    context = playbacks.context_for_playback(player["playback_id"])
+    stored = ((record or {}).get("details") or {}).get("remote_context") or {}
+    if stored.get("vpsHost") and stored.get("vpsAccess"):
+        context.update(stored)
+    else:
+        for name, value in stored.items():
+            if name in ("vpsHost", "vpsAccess"):
+                continue
+            if not context.get(name) and value:
+                context[name] = value
+        if not context.get("vpsHost") and stored.get("vpsHost"):
+            context["vpsHost"] = stored["vpsHost"]
+            context["vpsAccess"] = ""
+
+    suggestions = []
+    seen = set()
+    media_key = identity.get("media_key")
+    audio_fp = identity.get("audio_fingerprint")
+    if media_key:
+        for item in await offsets.list():
+            if item["cache_key"] == cache_key or item["media_key"] != media_key:
+                continue
+            if audio_fp and item["audio_fingerprint"] != audio_fp:
+                continue
+            seen.add(item["cache_key"])
+            suggestions.append({
+                "source": "local offset record", "cache_key": item["cache_key"],
+                **{name: item[name] for name in (
+                    "media_key", "resolution", "video_fingerprint", "audio_fingerprint"
+                )},
+            })
+        for other in playbacks.snapshot()["players"]:
+            if other["playback_id"] == player["playback_id"]:
+                continue
+            candidate, missing = _player_offset_identity(other)
+            if missing or candidate["media_key"] != media_key:
+                continue
+            if audio_fp and candidate["audio_fingerprint"] != audio_fp:
+                continue
+            other_key = other.get("cache_key") or offsets.key(
+                candidate["media_key"], candidate["resolution"],
+                candidate["video_fingerprint"], candidate["audio_fingerprint"],
+            )
+            if other_key in seen:
+                continue
+            seen.add(other_key)
+            suggestions.append({"source": "previous playback", "cache_key": other_key, **candidate})
+            if len(suggestions) >= 8:
+                break
+
+    return {
+        "cache_key": cache_key,
+        "identity": identity,
+        "local_record_found": bool(record),
+        "selected_offset": player.get("current_offset"),
+        "selected_source": player.get("control_source") or "request",
+        "connection": {
+            "configured_api": bool(offsets.api_url),
+            "vpsHost": context.get("vpsHost") or "",
+            "vpsAccessAvailable": bool(context.get("vpsAccess")),
+        },
+        "suggestions": suggestions[:8],
+        "offset_observed": bool(player.get("request_count")) or player.get("control_source") != "request",
+    }, record, context
+
+
+def _supplied_upload_identity(body: dict, identity: dict) -> dict:
+    result = dict(identity)
+    for name in ("media_key", "video_fingerprint", "audio_fingerprint"):
+        if name not in body:
+            continue
+        value = body[name]
+        if not isinstance(value, str) or len(value) > 500:
+            raise HTTPException(status_code=400, detail=f"{name} must be text of at most 500 characters")
+        result[name] = value.strip()
+    if "resolution" in body:
+        raw = body["resolution"]
+        try:
+            result["resolution"] = int(raw) if str(raw).strip() else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="resolution must be an integer") from exc
+        if result["resolution"] is not None and not 1 <= result["resolution"] <= 10000:
+            raise HTTPException(status_code=400, detail="resolution must be between 1 and 10000")
+    return result
+
+
+def _require_remote_upload(status: dict):
+    if status.get("remote_uploaded"):
+        return
+    if status.get("missing_fields"):
+        raise HTTPException(status_code=409, detail={
+            "code": "UPLOAD_CONTEXT_REQUIRED",
+            "message": status.get("remote_error") or "More upload details are required.",
+            "missing_fields": status["missing_fields"],
+        })
+    raise HTTPException(status_code=502, detail=status)
+
+
+@app.get("/api/dashboard/players/{playback_id}/offset/upload-info", include_in_schema=False)
+async def dashboard_player_upload_info(playback_id: str, request: Request):
+    _require_admin(request)
+    player = playbacks.get(playback_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="playback not found")
+    info, _, _ = await _player_upload_info(player)
+    return info
+
+
+@app.post("/api/dashboard/players/{playback_id}/offset/upload", include_in_schema=False)
+async def dashboard_upload_player_offset(playback_id: str, request: Request):
+    _require_admin(request)
+    body = await _dashboard_upload_body(request)
+    supplied_context = _dashboard_upload_context(body)
+    player = playbacks.get(playback_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="playback not found")
+    info, record, context = await _player_upload_info(player)
+    if not info["offset_observed"]:
+        raise HTTPException(status_code=409, detail="No HLS offset has been observed yet. Wait for playback or apply a manual offset first.")
+    identity = _supplied_upload_identity(body, info["identity"])
+    if record and identity != info["identity"]:
+        raise HTTPException(status_code=409, detail="An existing local offset record fixes this identity; edit a different playback instead")
+    cache_key = str(body.get("cache_key", info["cache_key"]) or "").strip()
+    if len(cache_key) > 128:
+        raise HTTPException(status_code=400, detail="cache_key is too long")
+    if record and cache_key != info["cache_key"]:
+        raise HTTPException(status_code=409, detail="An existing local offset record fixes this cache key")
+    required = ("media_key", "resolution", "video_fingerprint", "audio_fingerprint")
+    missing = [name for name in required if identity.get(name) in (None, "")]
+    if not cache_key and missing:
+        raise HTTPException(status_code=409, detail={
+            "code": "UPLOAD_IDENTITY_REQUIRED",
+            "message": "Enter an exact cache key, or provide " + ", ".join(missing) + " to generate one.",
+            "missing_fields": missing,
+        })
+    if not missing:
+        generated_key = offsets.key(
+            identity["media_key"], identity["resolution"],
+            identity["video_fingerprint"], identity["audio_fingerprint"],
+        )
+        cache_key = cache_key or generated_key
+    if supplied_context.get("vpsHost") and supplied_context["vpsHost"].rstrip("/") != str(context.get("vpsHost") or "").rstrip("/") and not supplied_context.get("vpsAccess"):
+        context["vpsAccess"] = ""
+    context.update(supplied_context)
+    missing_context = []
+    if not offsets.api_url:
+        missing_context = [name for name in ("vpsHost", "vpsAccess") if not context.get(name)]
+    if missing_context:
+        raise HTTPException(status_code=409, detail={
+            "code": "UPLOAD_CONTEXT_REQUIRED",
+            "message": "Enter " + " and ".join(missing_context) + " to upload to the VPS.",
+            "missing_fields": missing_context,
+        })
+    identity["cache_key"] = cache_key
+    selected_result = _selected_player_offset(player)
+    _offset_values(selected_result)
+    status = await offsets.upload_player_value({**identity, **context}, selected_result)
+    playbacks.note(
+        "remote-upload", cache_key=cache_key, playback_id=playback_id,
+        selected_source=selected_result.get("selected_for_upload"), status=status,
+    )
+    if not status.get("remote_uploaded") and status.get("remote_status") in (400, 422) and missing:
+        raise HTTPException(status_code=409, detail={
+            "code": "UPLOAD_IDENTITY_REQUIRED",
+            "message": "The remote server rejected a key-only upload. Enter the exact missing identity fields and retry.",
+            "missing_fields": missing,
+        })
+    _require_remote_upload(status)
+    playbacks.attach_cache_key(playback_id, cache_key, {
+        name: value for name, value in identity.items() if value not in (None, "")
+    })
+    return {"ok": True, "cache_key": cache_key, "storage": status}
+
+
+@app.post("/api/dashboard/offsets/{cache_key}/upload", include_in_schema=False)
+async def dashboard_upload_offset(cache_key: str, request: Request,
+                                  playback_id: str | None = None):
+    _require_admin(request)
+    supplied_context = _dashboard_upload_context(await _dashboard_upload_body(request))
     selected_result = None
     if playback_id:
         player = playbacks.get(playback_id)
@@ -704,19 +947,24 @@ async def dashboard_upload_offset(cache_key: str, request: Request,
             raise HTTPException(status_code=404, detail="playback not found")
         if player.get("cache_key") != cache_key:
             raise HTTPException(status_code=409, detail="playback does not use this offset record")
-        source = str(player.get("control_source") or "request")
-        candidate = (player.get("offset_candidates") or {}).get(source) or {}
-        selected_result = dict(candidate.get("result") or candidate)
-        selected_result.update({
-            "status": "ok",
-            "offset": float(player.get("current_offset") or 0.0),
-            "rate": float(player.get("current_rate") or 1.0),
-            "cached": source == "cached",
-            "custom": source == "manual",
-            "selected_for_upload": source,
-        })
+        selected_result = _selected_player_offset(player)
     try:
-        context = {**playbacks.context_for_cache(cache_key), **supplied_context}
+        context = (
+            playbacks.context_for_playback(playback_id)
+            if playback_id else playbacks.context_for_cache(cache_key)
+        )
+        record = await offsets.get(cache_key)
+        stored = ((record or {}).get("details") or {}).get("remote_context") or {}
+        if (stored.get("vpsHost") and stored.get("vpsAccess")
+                and (not playback_id or not context.get("vpsHost") or not context.get("vpsAccess"))):
+            context.update(stored)
+        if supplied_context.get("vpsHost") and supplied_context["vpsHost"].rstrip("/") != str(context.get("vpsHost") or "").rstrip("/") and not supplied_context.get("vpsAccess"):
+            raise HTTPException(status_code=409, detail={
+                "code": "UPLOAD_CONTEXT_REQUIRED",
+                "message": "Changing VPS host also requires its matching vpsAccess.",
+                "missing_fields": ["vpsAccess"],
+            })
+        context.update(supplied_context)
         status = await offsets.upload(cache_key, context, selected_result)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -724,12 +972,5 @@ async def dashboard_upload_offset(cache_key: str, request: Request,
         "remote-upload", cache_key=cache_key, playback_id=playback_id,
         selected_source=(selected_result or {}).get("selected_for_upload"), status=status,
     )
-    if not status.get("remote_uploaded"):
-        if status.get("missing_fields"):
-            raise HTTPException(status_code=409, detail={
-                "code": "UPLOAD_CONTEXT_REQUIRED",
-                "message": status.get("remote_error") or "More upload details are required.",
-                "missing_fields": status["missing_fields"],
-            })
-        raise HTTPException(status_code=502, detail=status)
+    _require_remote_upload(status)
     return {"ok": True, "storage": status}

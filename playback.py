@@ -245,6 +245,22 @@ class PlaybackRegistry:
             changed += 1
         return changed
 
+    def attach_cache_key(self, playback_id: str, cache_key: str, metadata: dict) -> dict:
+        """Attach a dashboard-created offset identity to an existing playback."""
+        player = self._players.get(playback_id)
+        if not player:
+            raise KeyError("active playback not found")
+        player["cache_key"] = str(cache_key)
+        if metadata.get("resolution") is not None:
+            player["resolution"] = metadata["resolution"]
+        player["sync_metadata"] = {
+            **(player.get("sync_metadata") or {}),
+            **safe_metadata(metadata),
+        }
+        player["updated_at"] = time.time()
+        self._event("offset-cache-attached", playback_id, cache_key=cache_key)
+        return self._public_player(player)
+
     def restore_automatic(self, playback_id: str, requested_source: str | None = None) -> dict:
         player = self._players.get(playback_id)
         if not player:
@@ -281,13 +297,24 @@ class PlaybackRegistry:
     def context_for_cache(self, cache_key: str) -> dict:
         matches = [player for player in self._players.values() if player.get("cache_key") == cache_key]
         latest = max(matches, key=lambda player: player.get("updated_at") or 0) if matches else None
-        context = self._context_from_player(latest) if latest else {}
+        return self._context_with_fallback(latest)
+
+    def context_for_playback(self, playback_id: str) -> dict:
+        return self._context_with_fallback(self._players.get(playback_id))
+
+    def _context_with_fallback(self, player: dict | None) -> dict:
+        context = self._context_from_player(player)
         fallback = self.latest_remote_context()
         if ((not context.get("vpsHost") or not context.get("vpsAccess"))
                 and fallback.get("vpsHost") and fallback.get("vpsAccess")):
             context["vpsHost"] = fallback["vpsHost"]
             context["vpsAccess"] = fallback["vpsAccess"]
+        elif not context.get("vpsHost") and fallback.get("vpsHost"):
+            context["vpsHost"] = fallback["vpsHost"]
+            context["vpsAccess"] = fallback.get("vpsAccess") or ""
         for key, value in fallback.items():
+            if key in ("vpsHost", "vpsAccess"):
+                continue
             if not context.get(key) and value:
                 context[key] = value
         return context
@@ -296,13 +323,22 @@ class PlaybackRegistry:
     def _context_from_player(player: dict | None) -> dict:
         if not player:
             return {}
-        metadata = {
-            **(player.get("prepare_request") or {}),
-            **(player.get("sync_metadata") or {}),
-        }
+        prepare = player.get("prepare_request") or {}
+        sync = player.get("sync_metadata") or {}
+        metadata = {**prepare, **sync}
+        contexts = [
+            {
+                "vpsHost": source.get("vpsHost") or source.get("vps_host") or "",
+                "vpsAccess": source.get("vpsAccess") or source.get("vps_access") or "",
+            }
+            for source in (sync, prepare)
+        ]
+        connection = next(
+            (item for item in contexts if item["vpsHost"] and item["vpsAccess"]),
+            next((item for item in contexts if item["vpsHost"]), contexts[0]),
+        )
         return {
-            "vpsHost": metadata.get("vpsHost") or metadata.get("vps_host") or "",
-            "vpsAccess": metadata.get("vpsAccess") or metadata.get("vps_access") or "",
+            **connection,
             "provider": metadata.get("provider") or "",
             "server": metadata.get("server") or "",
             "title": metadata.get("title") or "",
@@ -322,11 +358,17 @@ class PlaybackRegistry:
         )
         if complete:
             return complete
-        context = {}
+        context = {"vpsHost": "", "vpsAccess": ""}
         for candidate in candidates:
             for key, value in candidate.items():
+                if key in ("vpsHost", "vpsAccess"):
+                    continue
                 if not context.get(key) and value:
                     context[key] = value
+        partial = next((item for item in candidates if item.get("vpsHost")), None)
+        if partial:
+            context["vpsHost"] = partial["vpsHost"]
+            context["vpsAccess"] = partial.get("vpsAccess") or ""
         return context
 
     def restore_for_cache(self, cache_key: str) -> int:

@@ -75,6 +75,16 @@ input:focus { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,91,33,
 .upload-dialog-message { margin: 11px 0 21px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .upload-dialog-field { margin-top: 14px; }
 .upload-dialog-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 24px; }
+.upload-dialog-field small { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.upload-dialog label span { color: var(--orange); }
+.player-upload-dialog input[readonly] { opacity: .65; cursor: not-allowed; }
+.player-upload-dialog { width: min(690px,calc(100% - 28px)); max-height: min(90vh,900px); overflow: auto; }
+.upload-identity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.upload-suggestions { margin-top: 18px; padding: 12px; background: #0b0d0e; border: 1px solid var(--line); border-radius: 5px; }
+.upload-suggestions > strong { display: block; margin-bottom: 6px; font-size: 11px; }
+.upload-suggestions > p { margin: 0 0 9px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.upload-suggestions button { display: block; width: 100%; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.player-upload-dialog .error { margin: 0 0 12px; }
 .section { margin-top: 52px; }
 .section-heading { display: flex; justify-content: space-between; align-items: end; gap: 30px; margin-bottom: 18px; }
 .section-heading.slim { align-items: center; }
@@ -218,6 +228,7 @@ footer a { color: var(--ink); }
   .edit-controls { grid-template-columns: 1fr; }
   .offset-hero { grid-template-columns: 1fr; }
   .candidate-list { grid-template-columns: 1fr; }
+  .upload-identity-grid { grid-template-columns: 1fr; }
   .tabs { overflow-x: auto; }
 }
 
