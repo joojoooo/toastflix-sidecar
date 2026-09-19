@@ -384,3 +384,13 @@ Controlla poi:
 docker compose logs --tail=100
 curl http://IP_DELLA_MACCHINA:3169/health
 ```
+
+
+## Supporto Cuts Studio & Timeline Multi-Cut
+
+Il sidecar supporta nativamente le regole avanzate generate da ToastFlix Cuts Studio:
+
+- **Offset Hardware fMP4 (`video_start_time`)**: gestito automaticamente in fase di sync acustico.
+- **FPS Rate Esteso (0.85x - 1.15x)**: supporto completo per conversioni di velocità e correzione deriva framerate (es. PAL 25fps -> Cinema 23.976fps con rate `0.959040` o viceversa `1.041667`).
+- **Tagli Multipli (`c=`)**: array JSON o Base64 URL-safe con intervalli temporali da scartare (`audio_cut`) o da colmare con discontinuità (`video_gap`, `mute`).
+- **Ponte Audio Inglese (`b=`)**: inserimento trasparente della traccia originale inglese (`bridge_hid`) durante le scene inedite con marcatori `#EXT-X-DISCONTINUITY` e `#EXT-X-MAP`.

@@ -1,3 +1,24 @@
+
+def parse_cuts_param(c_str: str | None) -> list[dict]:
+    if not c_str:
+        return []
+    try:
+        raw = str(c_str).strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            data = json.loads(raw)
+        else:
+            import base64
+            padded = raw + "=" * (-len(raw) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            data = json.loads(decoded)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
 import asyncio
 import base64
 import hashlib
@@ -143,16 +164,119 @@ class AudioStore:
         return bool(expiries) and min(expiries) > time.time() + safety_window
 
     @staticmethod
-    def timeline(metadata: dict, offset: float = 0.0, rate: float = 1.0):
-        if not 0.998 <= rate <= 1.002:
+    def timeline(metadata: dict, offset: float = 0.0, rate: float = 1.0,
+                 cuts: list[dict] | None = None, bridge_metadata: dict | None = None,
+                 hid: str = "", bridge_hid: str = ""):
+        if not 0.85 <= rate <= 1.15:
             raise ValueError("audio rate outside supported range")
+        if not cuts:
+            entries = []
+            for index, (start, duration) in enumerate(zip(metadata["starts"], metadata["durs"])):
+                shifted = float(start) + float(offset)
+                trim = max(0.0, -shifted)
+                if trim >= float(duration) - 0.02:
+                    continue
+                entries.append({
+                    "idx": index,
+                    "hid": hid,
+                    "start": max(0.0, shifted / rate),
+                    "trim": trim,
+                    "duration": (float(duration) - trim) / rate,
+                    "discontinuity": False,
+                })
+            return entries
+
+        parsed_cuts = []
+        for c in cuts:
+            if not isinstance(c, dict):
+                continue
+            start_s = float(c.get("start_sec") if c.get("start_sec") is not None else (c.get("start") or 0.0))
+            end_s = float(c.get("end_sec") if c.get("end_sec") is not None else (c.get("end") or start_s))
+            dur_s = float(c.get("duration_sec") if c.get("duration_sec") is not None else max(0.0, end_s - start_s))
+            act = str(c.get("action") or c.get("type") or "").strip().lower()
+            tgt = str(c.get("target") or "").strip().lower()
+            is_audio_cut = act in ("audio_cut", "cut_audio", "skip_audio") or (tgt == "vix_audio" and act != "english_bridge")
+            parsed_cuts.append({
+                "start_sec": start_s,
+                "end_sec": end_s,
+                "duration_sec": dur_s,
+                "action": act,
+                "is_audio_cut": is_audio_cut,
+            })
+        parsed_cuts.sort(key=lambda x: x["start_sec"])
+
+        audio_cuts = [c for c in parsed_cuts if c["is_audio_cut"]]
+        video_gaps = [c for c in parsed_cuts if not c["is_audio_cut"]]
+
         entries = []
-        for index, (start, duration) in enumerate(zip(metadata["starts"], metadata["durs"])):
-            shifted = float(start) + float(offset)
-            trim = max(0.0, -shifted)
+        prev_orig_idx = None
+        has_pending_discontinuity = False
+        inserted_bridges = set()
+
+        for index, (orig_start, duration) in enumerate(zip(metadata["starts"], metadata["durs"])):
+            mid = orig_start + duration / 2.0
+            is_dropped = False
+            cum_audio_cut = 0.0
+            for ac in audio_cuts:
+                if ac["start_sec"] <= mid < ac["end_sec"]:
+                    is_dropped = True
+                    has_pending_discontinuity = True
+                    break
+                elif orig_start >= ac["end_sec"]:
+                    cum_audio_cut += ac["duration_sec"]
+
+            if is_dropped:
+                continue
+
+            eff_audio_time = orig_start - cum_audio_cut
+            v_time = (eff_audio_time + offset) / rate
+
+            cum_video_gap = 0.0
+            for vg_idx, vg in enumerate(video_gaps):
+                if v_time >= vg["start_sec"]:
+                    if vg_idx not in inserted_bridges:
+                        inserted_bridges.add(vg_idx)
+                        if vg["action"] == "english_bridge" and bridge_metadata:
+                            b_starts = bridge_metadata.get("starts") or []
+                            b_durs = bridge_metadata.get("durs") or []
+                            first_bridge_seg = True
+                            for b_idx, (b_start, b_dur) in enumerate(zip(b_starts, b_durs)):
+                                b_mid = b_start + b_dur / 2.0
+                                if vg["start_sec"] - 1.0 <= b_mid < vg["end_sec"] + 1.0:
+                                    entries.append({
+                                        "idx": b_idx,
+                                        "hid": bridge_hid,
+                                        "start": max(0.0, float(b_start)),
+                                        "trim": 0.0,
+                                        "duration": float(b_dur),
+                                        "discontinuity": first_bridge_seg,
+                                    })
+                                    first_bridge_seg = False
+                        has_pending_discontinuity = True
+                    cum_video_gap += vg["duration_sec"]
+
+            final_v_time = max(0.0, v_time + cum_video_gap)
+            trim = max(0.0, -final_v_time)
             if trim >= float(duration) - 0.02:
                 continue
-            entries.append({"idx": index, "start": max(0.0, shifted / rate), "trim": trim, "duration": (float(duration) - trim) / rate})
+
+            is_discont = False
+            if has_pending_discontinuity:
+                is_discont = True
+                has_pending_discontinuity = False
+            elif prev_orig_idx is not None and index != prev_orig_idx + 1:
+                is_discont = True
+
+            prev_orig_idx = index
+            entries.append({
+                "idx": index,
+                "hid": hid,
+                "start": final_v_time,
+                "trim": trim,
+                "duration": (float(duration) - trim) / rate,
+                "discontinuity": is_discont,
+            })
+
         return entries
 
     async def _download(self, url: str, headers: dict, redirects: int = 0):
@@ -316,14 +440,17 @@ class AudioStore:
         else:
             struct.pack_into(">I", fragment, position + header + 4, value)
 
-    async def fragment(self, hid: str, index: int, offset: float, rate: float):
+    async def fragment(self, hid: str, index: int, offset: float, rate: float,
+                       cuts: list[dict] | None = None, bridge_metadata: dict | None = None):
         metadata = self.metadata(hid)
-        timeline = self.timeline(metadata, offset, rate)
-        item = next((entry for entry in timeline if entry["idx"] == index), None)
+        timeline = self.timeline(metadata, offset, rate, cuts=cuts, bridge_metadata=bridge_metadata, hid=hid)
+        item = next((entry for entry in timeline if entry["idx"] == index and entry.get("hid", hid) == hid), None)
         if not item:
             raise ValueError("audio segment outside timeline")
         directory = self._dir(hid)
-        suffix = f"{int(round(offset * 1000)):+d}_r{int(round(rate * 1e9))}"
+        cuts_hash = hashlib.sha1(json.dumps(cuts or [], sort_keys=True).encode()).hexdigest()[:8] if cuts else ""
+        cuts_suffix = f"_c{cuts_hash}" if cuts_hash else ""
+        suffix = f"{int(round(offset * 1000)):+d}_r{int(round(rate * 1e9))}{cuts_suffix}"
         init_path = directory / f"init_{suffix}.mp4"
         fragment_path = directory / f"s{index}_{suffix}.m4s"
         if init_path.exists() and fragment_path.exists():
