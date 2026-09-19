@@ -50,6 +50,39 @@ class PlaybackRegistryTests(unittest.TestCase):
         self.assertEqual(restored["current_offset"], 0.5)
         self.assertEqual(restored["control_source"], "cached")
 
+    def test_dashboard_cuts_override_request_cuts_until_restored(self):
+        requested = [{
+            "start_sec": 5.0, "end_sec": 10.0, "duration_sec": 5.0,
+            "action": "audio_cut",
+        }]
+        cuts, bridge_hid, control = self.registry.resolve_cuts(
+            self.hid, self.token, requested, "b" * 16, "playlist"
+        )
+        self.assertEqual(cuts, requested)
+        self.assertEqual(bridge_hid, "b" * 16)
+        self.assertEqual(control["source"], "request")
+
+        manual = [{
+            "start_sec": 20.0, "end_sec": 25.0, "duration_sec": 5.0,
+            "action": "mute",
+        }]
+        changed = self.registry.set_cuts(self.playback_id, manual, "c" * 16)
+        self.assertTrue(changed["pending_cuts_playlist"])
+        cuts, bridge_hid, control = self.registry.resolve_cuts(
+            self.hid, self.token, requested, "b" * 16, "segment"
+        )
+        self.assertEqual(cuts, manual)
+        self.assertEqual(bridge_hid, "c" * 16)
+        self.assertEqual(control["source"], "manual")
+        self.assertTrue(self.registry.get(self.playback_id)["pending_cuts_playlist"])
+
+        self.registry.resolve_cuts(self.hid, self.token, requested, "b" * 16, "playlist")
+        self.assertFalse(self.registry.get(self.playback_id)["pending_cuts_playlist"])
+        restored = self.registry.restore_request_cuts(self.playback_id)
+        self.assertEqual(restored["current_cuts"], requested)
+        self.assertEqual(restored["current_bridge_hid"], "b" * 16)
+        self.assertEqual(restored["cuts_source"], "request")
+
     def test_dashboard_can_attach_a_generated_cache_key(self):
         attached = self.registry.attach_cache_key(self.playback_id, "generated-key", {
             "cache_key": "generated-key",

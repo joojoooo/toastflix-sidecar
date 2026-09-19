@@ -184,6 +184,114 @@ class DashboardApiTests(unittest.TestCase):
         self.assertIn("o=-125", response.text)
         self.assertFalse(sidecar.playbacks.get(playback_id)["pending_player_request"])
 
+    def test_dashboard_cuts_override_the_next_hls_playlist(self):
+        hid = "4" * 16
+        metadata = {
+            "media_key": "movie:cuts:0:0",
+            "language": "ita",
+            "source_fingerprint": "audio-fp",
+            "starts": [0.0, 5.0, 10.0],
+            "durs": [5.0, 5.0, 5.0],
+            "segs": [f"https://cdn.example.test/{index}.ts" for index in range(3)],
+            "headers": {},
+        }
+        playback_id = sidecar.playbacks.register(
+            hid, "player-test-token", metadata, cached_audio=False
+        )
+        headers = {"Authorization": "Bearer admin-test-token"}
+        changed = self.client.patch(
+            f"/api/dashboard/players/{playback_id}/cuts",
+            headers=headers,
+            json={
+                "cuts": [{"start_sec": 0, "end_sec": 5, "action": "audio_cut"}],
+                "bridge_hid": "",
+            },
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertTrue(changed.json()["player"]["pending_cuts_playlist"])
+
+        original_metadata = sidecar.audio.metadata
+        sidecar.audio.metadata = lambda audio_hid: metadata
+        try:
+            response = self.client.get(
+                f"/dual/aud/{hid}/audio.m3u8",
+                params={
+                    "o": 0,
+                    "r": 1_000_000_000,
+                    "t": "player-test-token",
+                    "c": '[{"start_sec":10,"end_sec":15,"action":"audio_cut"}]',
+                },
+            )
+        finally:
+            sidecar.audio.metadata = original_metadata
+
+        self.assertEqual(response.status_code, 200)
+        segment_lines = [line for line in response.text.splitlines() if "/s" in line]
+        self.assertFalse(any("/s0.m4s" in line for line in segment_lines))
+        self.assertTrue(any("/s1.m4s" in line for line in segment_lines))
+        self.assertEqual(response.headers["x-sidecar-cuts-source"], "manual")
+        self.assertFalse(sidecar.playbacks.get(playback_id)["pending_cuts_playlist"])
+
+    def test_dashboard_rejects_invalid_cuts_and_a_bridge_without_audio(self):
+        playback_id = sidecar.playbacks.register(
+            "6" * 16, "player-test-token", {"media_key": "movie:cuts"}
+        )
+        path = f"/api/dashboard/players/{playback_id}/cuts"
+        headers = {"Authorization": "Bearer admin-test-token"}
+        invalid = self.client.patch(path, headers=headers, json={"cuts": [
+            {"start_sec": 5, "end_sec": 1, "duration_sec": 0, "action": "audio_cut"},
+        ]})
+        missing_bridge = self.client.patch(path, headers=headers, json={"cuts": [
+            {"start_sec": 10, "end_sec": 15, "action": "english_bridge"},
+        ]})
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("duration > 0", invalid.json()["detail"])
+        self.assertEqual(missing_bridge.status_code, 400)
+        self.assertIn("bridge audio track", missing_bridge.json()["detail"])
+
+    def test_english_bridge_playlist_renders_bridge_segments_directly(self):
+        hid = "7" * 16
+        bridge_hid = "8" * 16
+        main_metadata = {
+            "media_key": "movie:bridge", "language": "ita",
+            "starts": [0.0, 5.0, 10.0], "durs": [5.0, 5.0, 5.0],
+            "segs": [f"https://cdn.example.test/ita-{index}.ts" for index in range(3)],
+            "headers": {},
+        }
+        bridge_metadata = {
+            "media_key": "movie:bridge", "language": "eng",
+            "starts": [0.0, 5.0, 10.0], "durs": [5.0, 5.0, 5.0],
+            "segs": [f"https://cdn.example.test/eng-{index}.ts" for index in range(3)],
+            "headers": {},
+        }
+        playback_id = sidecar.playbacks.register(hid, "player-test-token", main_metadata)
+        sidecar.playbacks.register(bridge_hid, "player-test-token", bridge_metadata)
+        sidecar.playbacks.set_cuts(playback_id, [{
+            "start_sec": 5.0, "end_sec": 10.0, "duration_sec": 5.0,
+            "action": "english_bridge",
+        }], bridge_hid)
+        original_metadata = sidecar.audio.metadata
+        sidecar.audio.metadata = lambda audio_hid: (
+            bridge_metadata if audio_hid == bridge_hid else main_metadata
+        )
+        try:
+            response = self.client.get(
+                f"/dual/aud/{hid}/audio.m3u8",
+                params={"t": "player-test-token"},
+            )
+        finally:
+            sidecar.audio.metadata = original_metadata
+
+        bridge_lines = [
+            line for line in response.text.splitlines()
+            if f"/dual/aud/{bridge_hid}/s" in line
+        ]
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(bridge_lines)
+        self.assertTrue(all("br=1" in line for line in bridge_lines))
+        self.assertTrue(all("c=" not in line and "b=" not in line for line in bridge_lines))
+
     def test_manual_upload_uses_the_current_calculated_or_custom_selection(self):
         hid = "b" * 16
         cache_key = "selected-upload-cache-key"

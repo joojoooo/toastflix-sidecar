@@ -90,6 +90,13 @@ class PlaybackRegistry:
                 "last_request_kind": None,
                 "last_requested_offset": 0.0,
                 "last_requested_rate": 1.0,
+                "current_cuts": [],
+                "current_bridge_hid": "",
+                "cuts_source": "request",
+                "cuts_revision": 0,
+                "cuts_applied_revision": 0,
+                "last_requested_cuts": [],
+                "last_requested_bridge_hid": "",
                 "cache_hit": None,
                 "cache_source": None,
                 "sync_result": None,
@@ -219,6 +226,48 @@ class PlaybackRegistry:
             "revision": player["revision"],
         }
 
+    def resolve_cuts(self, hid: str, token: str, requested_cuts: list[dict] | None,
+                     requested_bridge_hid: str, request_kind: str) -> tuple[list[dict], str, dict]:
+        """Resolve request-carried cuts against a live dashboard override."""
+        playback_id = self._keys.get((self._token_hash(token), hid))
+        player = self._players.get(playback_id or "")
+        cuts = safe_metadata(requested_cuts or [])
+        bridge_hid = str(requested_bridge_hid or "").strip()
+        if not player:
+            return cuts, bridge_hid, {
+                "playback_id": None,
+                "source": "request",
+                "revision": 0,
+            }
+
+        changed = (
+            cuts != player.get("last_requested_cuts", [])
+            or bridge_hid != player.get("last_requested_bridge_hid", "")
+        )
+        player["last_requested_cuts"] = cuts
+        player["last_requested_bridge_hid"] = bridge_hid
+        if player.get("cuts_source", "request") == "request":
+            player["current_cuts"] = cuts
+            player["current_bridge_hid"] = bridge_hid
+        if request_kind == "playlist":
+            player["cuts_applied_revision"] = player.get("cuts_revision", 0)
+            if changed:
+                self._event(
+                    "cuts-observed",
+                    player["playback_id"],
+                    cut_count=len(cuts),
+                    bridge_hid=bridge_hid or None,
+                )
+        return (
+            safe_metadata(player.get("current_cuts") or []),
+            str(player.get("current_bridge_hid") or ""),
+            {
+                "playback_id": player["playback_id"],
+                "source": player.get("cuts_source", "request"),
+                "revision": player.get("cuts_revision", 0),
+            },
+        )
+
     def set_override(self, playback_id: str, offset: float, rate: float) -> dict:
         player = self._players.get(playback_id)
         if not player:
@@ -236,6 +285,44 @@ class PlaybackRegistry:
         self._event(
             "manual-offset-saved", playback_id,
             cache_key=player.get("cache_key"), offset=offset, rate=rate,
+        )
+        return self._public_player(player)
+
+    def set_cuts(self, playback_id: str, cuts: list[dict], bridge_hid: str = "") -> dict:
+        player = self._players.get(playback_id)
+        if not player:
+            raise KeyError("active playback not found")
+        player.update({
+            "current_cuts": safe_metadata(cuts),
+            "current_bridge_hid": str(bridge_hid or "").strip(),
+            "cuts_source": "manual",
+            "cuts_revision": player.get("cuts_revision", 0) + 1,
+            "updated_at": time.time(),
+        })
+        self._event(
+            "cuts-updated",
+            playback_id,
+            cut_count=len(cuts),
+            bridge_hid=player["current_bridge_hid"] or None,
+        )
+        return self._public_player(player)
+
+    def restore_request_cuts(self, playback_id: str) -> dict:
+        player = self._players.get(playback_id)
+        if not player:
+            raise KeyError("active playback not found")
+        player.update({
+            "current_cuts": safe_metadata(player.get("last_requested_cuts") or []),
+            "current_bridge_hid": str(player.get("last_requested_bridge_hid") or ""),
+            "cuts_source": "request",
+            "cuts_revision": player.get("cuts_revision", 0) + 1,
+            "updated_at": time.time(),
+        })
+        self._event(
+            "cuts-restored",
+            playback_id,
+            cut_count=len(player["current_cuts"]),
+            bridge_hid=player["current_bridge_hid"] or None,
         )
         return self._public_player(player)
 
@@ -407,6 +494,9 @@ class PlaybackRegistry:
     def _public_player(player: dict) -> dict:
         result = {key: value for key, value in player.items() if key != "token_hash"}
         result["pending_player_request"] = player["revision"] > player["applied_revision"]
+        result["pending_cuts_playlist"] = (
+            player.get("cuts_revision", 0) > player.get("cuts_applied_revision", 0)
+        )
         last_request = player.get("last_request_at") or 0
         recently_updated = (
             time.time() - (player.get("updated_at") or 0) < PLAYBACK_ACTIVE_GRACE_SECONDS

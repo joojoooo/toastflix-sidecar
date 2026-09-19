@@ -862,6 +862,277 @@ function createAudioPanel(player) {
   return panel;
 }
 
+function timelineSeconds(value) {
+  const seconds = Math.max(0, Number(value) || 0);
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds - minutes * 60;
+  return minutes ? `${minutes}:${remainder.toFixed(3).padStart(6, "0")}` : `${remainder.toFixed(3)}s`;
+}
+
+function trackDuration(player) {
+  const durations = player.audio_track?.metadata?.durs || player.audio_metadata?.durs || [];
+  const total = durations.reduce((sum, value) => sum + (Number(value) || 0), 0);
+  return total || Number(player.audio_metadata?.segment_summary?.duration_seconds) || 0;
+}
+
+function cutAction(value) {
+  const action = String(value || "").toLowerCase();
+  if (["audio_cut", "cut_audio", "skip_audio"].includes(action)) return "audio_cut";
+  if (action === "english_bridge") return "english_bridge";
+  return "mute";
+}
+
+function cutActionLabel(action) {
+  return ({
+    audio_cut: "Remove replacement audio",
+    english_bridge: "Use English bridge",
+    mute: "Leave a silent video gap",
+  })[cutAction(action)];
+}
+
+function createCutsPanel(player) {
+  const panel = element("div", "tab-panel cuts-panel");
+  const duration = trackDuration(player);
+  let cuts = (player.current_cuts || []).map((item) => ({
+    start_sec: Number(item.start_sec ?? item.start ?? 0),
+    end_sec: Number(item.end_sec ?? item.end ?? 0),
+    duration_sec: Number(item.duration_sec ?? Math.max(0, Number(item.end_sec ?? item.end ?? 0) - Number(item.start_sec ?? item.start ?? 0))),
+    action: cutAction(item.action || item.type),
+  }));
+
+  const header = element("div", "cuts-heading");
+  const title = element("div");
+  title.append(element("h4", "", "Cuts timeline"), element(
+    "p", "alignment-note",
+    "See every removed or inserted interval against the source track, then edit exact boundaries below.",
+  ));
+  const source = element(
+    "span", `cuts-source ${player.cuts_source === "manual" ? "manual" : ""}`.trim(),
+    player.cuts_source === "manual" ? "Dashboard override" : "Player-provided cuts",
+  );
+  header.append(title, source);
+
+  const stats = element("div", "cut-stats");
+  const timeline = element("div", "cuts-visual");
+  const ruler = element("div", "cuts-ruler");
+  const track = element("div", "cuts-track");
+  const baseline = element("div", "cuts-baseline");
+  baseline.append(element("span", "", "Replacement audio source"));
+  track.append(baseline);
+  timeline.append(ruler, track);
+
+  const legend = element("div", "cuts-legend");
+  [
+    ["audio_cut", "Replacement removed"],
+    ["english_bridge", "English audio inserted"],
+    ["mute", "Silent gap"],
+  ].forEach(([action, label]) => {
+    const item = element("span");
+    item.append(element("i", `action-${action}`), label);
+    legend.append(item);
+  });
+
+  const bridge = element("div", "bridge-picker");
+  const bridgeField = element("div");
+  const bridgeLabel = element("label", "", "English bridge audio HID");
+  const bridgeInput = element("input");
+  bridgeInput.type = "text";
+  bridgeInput.maxLength = 16;
+  bridgeInput.placeholder = "Choose another prepared audio track";
+  bridgeInput.value = player.current_bridge_hid || "";
+  const listId = `bridge-${player.playback_id}`;
+  bridgeInput.setAttribute("list", listId);
+  const bridgeOptions = element("datalist");
+  bridgeOptions.id = listId;
+  (currentState?.players || []).filter((candidate) => (
+    candidate.hid !== player.hid && candidate.session_id === player.session_id
+  )).forEach((candidate) => {
+    const option = element("option");
+    const language = languageInfo(candidate.audio_metadata?.language || candidate.audio_track?.metadata?.language);
+    option.value = candidate.hid;
+    option.label = `${language.code} · ${candidate.audio_metadata?.media_key || "prepared track"}`;
+    bridgeOptions.append(option);
+  });
+  bridgeField.append(bridgeLabel, bridgeInput, bridgeOptions);
+  bridge.append(bridgeField, element(
+    "p", "alignment-note",
+    "Required only for English bridge intervals. Use the HID of another prepared track from this session.",
+  ));
+
+  const editor = element("div", "cuts-editor");
+  const editorHead = element("div", "cut-row cut-row-head");
+  ["Cut", "Action", "Start", "End", "Duration", ""].forEach((label) => editorHead.append(element("span", "", label)));
+  const rows = element("div", "cut-rows");
+  const add = element("button", "button subtle compact", "+ Add interval");
+  add.type = "button";
+
+  const status = element("p", "cuts-status");
+  const actions = element("div", "action-row cuts-actions");
+  const save = element("button", "button primary", "Save cuts & queue playlist");
+  save.type = "button";
+  const restore = element("button", "button subtle", "Restore player-provided cuts");
+  restore.type = "button";
+  restore.disabled = player.cuts_source !== "manual";
+  actions.append(save, restore);
+
+  const validate = () => {
+    const normalized = cuts.map((item, index) => ({
+      index,
+      start_sec: Number(item.start_sec),
+      end_sec: Number(item.end_sec),
+      duration_sec: Number(item.duration_sec),
+      action: cutAction(item.action),
+    }));
+    const invalid = normalized.find((item) => (
+      !Number.isFinite(item.start_sec) || !Number.isFinite(item.end_sec) || !Number.isFinite(item.duration_sec)
+      || item.start_sec < 0 || item.end_sec <= item.start_sec || item.duration_sec <= 0
+      || item.end_sec > 86400 || item.duration_sec > 86400
+    ));
+    if (invalid) return { error: `Cut ${invalid.index + 1} needs a start ≥ 0, an end after its start, and a positive duration.` };
+    const sorted = [...normalized].sort((a, b) => a.start_sec - b.start_sec || a.end_sec - b.end_sec);
+    const bridgeHid = bridgeInput.value.trim();
+    if (bridgeHid && !/^[0-9a-f]{16}$/.test(bridgeHid)) return { error: "The bridge HID must contain 16 lowercase hexadecimal characters." };
+    if (sorted.some((item) => item.action === "english_bridge") && !bridgeHid) {
+      return { error: "Choose an English bridge track for the bridge intervals." };
+    }
+    return {
+      cuts: sorted.map((item) => ({
+        start_sec: item.start_sec,
+        end_sec: item.end_sec,
+        duration_sec: item.duration_sec,
+        action: item.action,
+      })),
+      bridge_hid: bridgeHid,
+    };
+  };
+
+  const renderVisual = () => {
+    const finiteEnds = cuts.map((item) => Number(item.end_sec)).filter(Number.isFinite);
+    const scale = Math.max(duration, ...finiteEnds, 1);
+    ruler.replaceChildren();
+    for (let index = 0; index <= 4; index += 1) {
+      const tick = element("span", "", timelineSeconds(scale * index / 4));
+      tick.style.left = `${index * 25}%`;
+      ruler.append(tick);
+    }
+    track.querySelectorAll(".cut-block,.cuts-empty").forEach((node) => node.remove());
+    cuts.forEach((item, index) => {
+      const start = Number(item.start_sec);
+      const end = Number(item.end_sec);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+      const block = element("button", `cut-block action-${cutAction(item.action)}`);
+      block.type = "button";
+      block.style.left = `${Math.max(0, Math.min(100, start / scale * 100))}%`;
+      block.style.width = `${Math.max(.7, Math.min(100 - start / scale * 100, (end - start) / scale * 100))}%`;
+      block.title = `Cut ${index + 1}: ${cutActionLabel(item.action)} · ${timelineSeconds(start)}–${timelineSeconds(end)}`;
+      block.setAttribute("aria-label", block.title);
+      block.append(element("strong", "", String(index + 1)), element("span", "", `${Number(item.duration_sec).toFixed(3)}s`));
+      block.addEventListener("click", () => rows.children[index]?.querySelector("input")?.focus());
+      track.append(block);
+    });
+    if (!cuts.length) track.append(element("span", "cuts-empty", "No cuts — the replacement track plays continuously."));
+
+    const audioRemoved = cuts.filter((item) => cutAction(item.action) === "audio_cut")
+      .reduce((sum, item) => sum + Math.max(0, Number(item.duration_sec) || 0), 0);
+    const gapsAdded = cuts.filter((item) => cutAction(item.action) !== "audio_cut")
+      .reduce((sum, item) => sum + Math.max(0, Number(item.duration_sec) || 0), 0);
+    const estimated = Math.max(0, duration - audioRemoved + gapsAdded);
+    const stat = (value, label) => {
+      const item = element("div");
+      item.append(element("strong", "", value), element("span", "", label));
+      return item;
+    };
+    stats.replaceChildren(
+      stat(`${cuts.length}`, "Intervals"),
+      stat(timelineSeconds(audioRemoved), "Audio removed"),
+      stat(timelineSeconds(gapsAdded), "Video gaps"),
+      stat(duration ? timelineSeconds(estimated) : "—", "Estimated result"),
+    );
+    const checked = validate();
+    save.disabled = Boolean(checked.error);
+    status.textContent = checked.error || (
+      player.pending_cuts_playlist
+        ? "Saved revision is waiting for the next top-level HLS playlist request. Restart playback if the player does not reload it."
+        : "Changes are previewed locally until you save. A playlist reload is required when the interval structure changes."
+    );
+    status.classList.toggle("error", Boolean(checked.error));
+  };
+
+  const renderRows = () => {
+    const fragment = document.createDocumentFragment();
+    cuts.forEach((item, index) => {
+      const row = element("div", "cut-row");
+      row.append(element("strong", "cut-index", String(index + 1)));
+      const action = element("select");
+      ["audio_cut", "english_bridge", "mute"].forEach((value) => {
+        const option = element("option", "", cutActionLabel(value));
+        option.value = value; option.selected = cutAction(item.action) === value; action.append(option);
+      });
+      action.setAttribute("aria-label", `Cut ${index + 1} action`);
+      const start = element("input"); start.type = "number"; start.min = "0"; start.max = "86400"; start.step = "0.001";
+      start.value = Number(item.start_sec).toFixed(3); start.setAttribute("aria-label", `Cut ${index + 1} start`);
+      const end = element("input"); end.type = "number"; end.min = "0"; end.max = "86400"; end.step = "0.001";
+      end.value = Number(item.end_sec).toFixed(3); end.setAttribute("aria-label", `Cut ${index + 1} end`);
+      const span = element("input", "cut-duration"); span.type = "number"; span.min = "0.001"; span.max = "86400"; span.step = "0.001";
+      span.value = Number(item.duration_sec).toFixed(3); span.setAttribute("aria-label", `Cut ${index + 1} duration`);
+      const remove = element("button", "button danger compact", "Remove"); remove.type = "button";
+      action.addEventListener("change", () => { item.action = action.value; renderVisual(); });
+      start.addEventListener("input", () => {
+        item.start_sec = start.value === "" ? NaN : Number(start.value);
+        renderVisual();
+      });
+      end.addEventListener("input", () => {
+        item.end_sec = end.value === "" ? NaN : Number(end.value);
+        renderVisual();
+      });
+      span.addEventListener("input", () => {
+        item.duration_sec = span.value === "" ? NaN : Number(span.value);
+        renderVisual();
+      });
+      remove.addEventListener("click", () => { cuts.splice(index, 1); renderRows(); });
+      row.append(action, start, end, span, remove); fragment.append(row);
+    });
+    rows.replaceChildren(fragment);
+    renderVisual();
+  };
+
+  add.addEventListener("click", () => {
+    const previousEnd = cuts.reduce((latest, item) => Math.max(latest, Number(item.end_sec) || 0), 0);
+    const start = duration && previousEnd >= duration ? Math.max(0, duration - 5) : previousEnd;
+    cuts.push({ start_sec: start, end_sec: start + 5, duration_sec: 5, action: "audio_cut" });
+    renderRows();
+    rows.lastElementChild?.querySelector("select")?.focus();
+  });
+  bridgeInput.addEventListener("input", renderVisual);
+  save.addEventListener("click", async () => {
+    const checked = validate();
+    if (checked.error) { showNotice(checked.error, true); return; }
+    save.disabled = true;
+    try {
+      const result = await api(`/api/dashboard/players/${encodeURIComponent(player.playback_id)}/cuts`, {
+        method: "PATCH", body: JSON.stringify(checked),
+      });
+      const index = currentState?.players?.findIndex((item) => item.playback_id === player.playback_id) ?? -1;
+      if (index >= 0) currentState.players[index] = { ...currentState.players[index], ...result.player };
+      sessionSignature = ""; renderSessions(currentState.players); showNotice(result.message);
+    } catch (error) { showNotice(error.message, true); save.disabled = false; }
+  });
+  restore.addEventListener("click", async () => {
+    restore.disabled = true;
+    try {
+      const result = await api(`/api/dashboard/players/${encodeURIComponent(player.playback_id)}/cuts/restore`, { method: "POST" });
+      const index = currentState?.players?.findIndex((item) => item.playback_id === player.playback_id) ?? -1;
+      if (index >= 0) currentState.players[index] = { ...currentState.players[index], ...result.player };
+      sessionSignature = ""; renderSessions(currentState.players); showNotice(result.message);
+    } catch (error) { showNotice(error.message, true); restore.disabled = false; }
+  });
+
+  editor.append(editorHead, rows, add);
+  panel.append(header, stats, timeline, legend, bridge, editor, status, actions);
+  renderRows();
+  return panel;
+}
+
 function createNetworkPanel(player) {
   const panel = element("div", "tab-panel");
   const audioMeta = player.audio_track?.metadata || player.audio_metadata || {};
@@ -995,11 +1266,12 @@ function createTrack(player) {
     details: createDetailsPanel(player, lang, source, registration),
     audio: createAudioPanel(player),
     alignment: createAlignmentLab(player, offset.input),
+    cuts: createCutsPanel(player),
     network: createNetworkPanel(player),
     raw: createRawPanel(player),
   };
   const selected = selectedTabs.get(player.playback_id) || "details";
-  Object.entries({ details: "Overview", audio: "Audio preview", alignment: "Alignment lab", network: "Links & credentials", raw: "Complete metadata" }).forEach(([key, label]) => {
+  Object.entries({ details: "Overview", audio: "Audio preview", alignment: "Alignment lab", cuts: `Cuts · ${(player.current_cuts || []).length}`, network: "Links & credentials", raw: "Complete metadata" }).forEach(([key, label]) => {
     const button = element("button", `tab-button ${selected === key ? "selected" : ""}`, label);
     button.type = "button"; button.dataset.tab = key;
     button.addEventListener("click", () => {
@@ -1052,7 +1324,9 @@ function renderSessions(players) {
     player.playback_id, player.current_offset, player.current_rate, player.control_source,
     player.revision, player.applied_revision, player.cache_key, player.cache_hit,
     player.cache_source, player.active, player.ended_at, Boolean(player.request_count),
-    player.sync_result, player.sync_metadata, player.metadata_edits,
+    player.sync_result, player.sync_metadata, player.metadata_edits, player.current_cuts,
+    player.current_bridge_hid, player.cuts_source, player.cuts_revision,
+    player.cuts_applied_revision, player.pending_cuts_playlist,
   ]));
   if (signature === sessionSignature) return;
   sessionSignature = signature;

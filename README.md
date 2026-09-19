@@ -394,3 +394,9 @@ Il sidecar supporta nativamente le regole avanzate generate da ToastFlix Cuts St
 - **FPS Rate Esteso (0.85x - 1.15x)**: supporto completo per conversioni di velocità e correzione deriva framerate (es. PAL 25fps -> Cinema 23.976fps con rate `0.959040` o viceversa `1.041667`).
 - **Tagli Multipli (`c=`)**: array JSON o Base64 URL-safe con intervalli temporali da scartare (`audio_cut`) o da colmare con discontinuità (`video_gap`, `mute`).
 - **Ponte Audio Inglese (`b=`)**: inserimento trasparente della traccia originale inglese (`bridge_hid`) durante le scene inedite con marcatori `#EXT-X-DISCONTINUITY` e `#EXT-X-MAP`.
+
+La scheda **Cuts** della dashboard mostra questi intervalli su una timeline proporzionale e
+permette di aggiungere, modificare o rimuovere `audio_cut`, `english_bridge` e gap muti.
+Le modifiche restano associate alla riproduzione attiva e hanno priorità sui parametri `c=` e
+`b=` ricevuti dal player. Dopo il salvataggio, ricarica la playlist HLS (o riavvia la
+riproduzione) per applicare la nuova struttura degli intervalli.

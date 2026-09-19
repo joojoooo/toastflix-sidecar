@@ -49,7 +49,10 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["X-Sidecar-Offset", "X-Sidecar-Offset-Source", "X-Sidecar-Revision"],
+    expose_headers=[
+        "X-Sidecar-Offset", "X-Sidecar-Offset-Source", "X-Sidecar-Revision",
+        "X-Sidecar-Cuts-Source", "X-Sidecar-Cuts-Revision",
+    ],
 )
 app.add_middleware(TrafficLogMiddleware, activity=activity)
 
@@ -84,6 +87,67 @@ def _offset_values(body: dict) -> tuple[float, float]:
     if not math.isfinite(rate) or not 0.998 <= rate <= 1.002:
         raise HTTPException(status_code=400, detail="rate must be between 0.998 and 1.002")
     return offset, rate
+
+
+def _cuts_values(body: dict) -> tuple[list[dict], str]:
+    cuts = body.get("cuts")
+    if not isinstance(cuts, list):
+        raise HTTPException(status_code=400, detail="cuts must be an array")
+    if len(cuts) > 100:
+        raise HTTPException(status_code=400, detail="cuts cannot contain more than 100 entries")
+    aliases = {
+        "audio_cut": "audio_cut",
+        "cut_audio": "audio_cut",
+        "skip_audio": "audio_cut",
+        "english_bridge": "english_bridge",
+        "video_gap": "mute",
+        "mute": "mute",
+    }
+    normalized = []
+    for index, item in enumerate(cuts):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"cut {index + 1} must be an object")
+        numeric_values = (item.get("start_sec"), item.get("end_sec"), item.get("duration_sec"))
+        if any(isinstance(value, bool) for value in numeric_values):
+            raise HTTPException(
+                status_code=400, detail=f"cut {index + 1} start, end, and duration must be numbers"
+            )
+        try:
+            start = float(item.get("start_sec"))
+            end = float(item.get("end_sec"))
+            duration = float(item.get("duration_sec", end - start))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"cut {index + 1} start, end, and duration must be numbers"
+            ) from exc
+        action = aliases.get(str(item.get("action") or "").strip().lower())
+        if not action:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cut {index + 1} action must be audio_cut, english_bridge, or mute",
+            )
+        if (not math.isfinite(start) or not math.isfinite(end) or not math.isfinite(duration)
+                or start < 0 or end <= start or duration <= 0):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"cut {index + 1} must have a finite start >= 0, end > start, "
+                        "and duration > 0"),
+            )
+        if end > 24 * 3600 or duration > 24 * 3600:
+            raise HTTPException(status_code=400, detail=f"cut {index + 1} exceeds 24 hours")
+        normalized.append({
+            "start_sec": round(start, 6),
+            "end_sec": round(end, 6),
+            "duration_sec": round(duration, 6),
+            "action": action,
+        })
+    normalized.sort(key=lambda item: (item["start_sec"], item["end_sec"]))
+    bridge_hid = str(body.get("bridge_hid") or "").strip()
+    if bridge_hid and not re.fullmatch(r"[0-9a-f]{16}", bridge_hid):
+        raise HTTPException(status_code=400, detail="bridge_hid must be a 16-character audio id")
+    if any(item["action"] == "english_bridge" for item in normalized) and not bridge_hid:
+        raise HTTPException(status_code=400, detail="English bridge cuts require a bridge audio track")
+    return normalized, bridge_hid
 
 
 def _base_url(request: Request) -> str:
@@ -220,12 +284,18 @@ def _audio_response(path: Path, media_type: str, cache_control: str = "no-cache"
     })
 
 
-def _audio_debug_headers(control: dict, offset: float) -> dict:
-    return {
+def _audio_debug_headers(control: dict, offset: float, cuts_control: dict | None = None) -> dict:
+    headers = {
         "X-Sidecar-Offset": f"{offset:.6f}",
         "X-Sidecar-Offset-Source": str(control.get("source") or "request"),
         "X-Sidecar-Revision": str(control.get("revision") or 0),
     }
+    if cuts_control is not None:
+        headers.update({
+            "X-Sidecar-Cuts-Source": str(cuts_control.get("source") or "request"),
+            "X-Sidecar-Cuts-Revision": str(cuts_control.get("revision") or 0),
+        })
+    return headers
 
 
 @app.api_route("/dual/aud/{hid}/audio.m3u8", methods=["GET", "HEAD"])
@@ -239,8 +309,10 @@ async def audio_playlist(hid: str, request: Request, o: int = 0, r: int = 1_000_
         )
         effective_o = int(round(offset * 1000))
         effective_r = int(round(rate * 1_000_000_000))
-        cuts = parse_cuts_param(c) if c else None
-        bridge_hid = b.strip() if b else ""
+        requested_cuts = parse_cuts_param(c) if c else []
+        cuts, bridge_hid, cuts_control = playbacks.resolve_cuts(
+            hid, token, requested_cuts, b, "playlist"
+        )
         bridge_metadata = None
         if bridge_hid:
             try:
@@ -266,13 +338,21 @@ async def audio_playlist(hid: str, request: Request, o: int = 0, r: int = 1_000_
         ]
 
         current_map_hid = None
+        cuts_query = json.dumps(cuts, separators=(",", ":"), ensure_ascii=False) if cuts else ""
         for item in timeline:
             item_hid = item.get("hid") or hid
-            item_query = {"o": effective_o, "r": effective_r, "t": token}
-            if c:
-                item_query["c"] = c
-            if b:
-                item_query["b"] = b
+            is_bridge_item = bool(bridge_hid and item_hid == bridge_hid and item_hid != hid)
+            if is_bridge_item:
+                # Bridge items already carry their source-track timestamp in the combined
+                # timeline. Render them directly instead of applying the main track's cuts
+                # a second time when the player follows this URI.
+                item_query = {"o": 0, "r": 1_000_000_000, "t": token, "br": 1}
+            else:
+                item_query = {"o": effective_o, "r": effective_r, "t": token}
+                if cuts_query:
+                    item_query["c"] = cuts_query
+                if bridge_hid:
+                    item_query["b"] = bridge_hid
             q_str = urlencode(item_query)
 
             if item.get("discontinuity"):
@@ -287,22 +367,29 @@ async def audio_playlist(hid: str, request: Request, o: int = 0, r: int = 1_000_
         lines.append("#EXT-X-ENDLIST")
         return Response("\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl",
                         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache",
-                                 **_audio_debug_headers(control, offset)})
+                                 **_audio_debug_headers(control, offset, cuts_control)})
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.api_route("/dual/aud/{hid}/init.mp4", methods=["GET", "HEAD"])
 async def audio_init(hid: str, request: Request, o: int = 0, r: int = 1_000_000_000,
-                     c: str = "", b: str = ""):
+                     c: str = "", b: str = "", br: int = 0):
     token = _require_session(request)
     try:
         metadata = audio.metadata(hid)
-        offset, rate, control = playbacks.resolve(
-            hid, token, o / 1000.0, r / 1_000_000_000, "init"
-        )
-        cuts = parse_cuts_param(c) if c else None
-        bridge_hid = b.strip() if b else ""
+        if br:
+            offset, rate = o / 1000.0, r / 1_000_000_000
+            control = cuts_control = {"source": "request", "revision": 0}
+            cuts, bridge_hid = [], ""
+        else:
+            offset, rate, control = playbacks.resolve(
+                hid, token, o / 1000.0, r / 1_000_000_000, "init"
+            )
+            requested_cuts = parse_cuts_param(c) if c else []
+            cuts, bridge_hid, cuts_control = playbacks.resolve_cuts(
+                hid, token, requested_cuts, b, "init"
+            )
         bridge_metadata = audio.metadata(bridge_hid) if bridge_hid else None
         timeline = audio.timeline(metadata, offset, rate, cuts=cuts,
                                   bridge_metadata=bridge_metadata, hid=hid, bridge_hid=bridge_hid)
@@ -312,26 +399,33 @@ async def audio_init(hid: str, request: Request, o: int = 0, r: int = 1_000_000_
         init_path, _ = await audio.fragment(hid, first_seg, offset, rate,
                                             cuts=cuts, bridge_metadata=bridge_metadata)
         return _audio_response(init_path, "video/mp4", "no-cache",
-                               _audio_debug_headers(control, offset))
+                               _audio_debug_headers(control, offset, cuts_control))
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.api_route("/dual/aud/{hid}/s{idx}.m4s", methods=["GET", "HEAD"])
 async def audio_segment(hid: str, idx: int, request: Request, o: int = 0, r: int = 1_000_000_000,
-                        c: str = "", b: str = ""):
+                        c: str = "", b: str = "", br: int = 0):
     token = _require_session(request)
     try:
-        offset, rate, control = playbacks.resolve(
-            hid, token, o / 1000.0, r / 1_000_000_000, "segment"
-        )
-        cuts = parse_cuts_param(c) if c else None
-        bridge_hid = b.strip() if b else ""
+        if br:
+            offset, rate = o / 1000.0, r / 1_000_000_000
+            control = cuts_control = {"source": "request", "revision": 0}
+            cuts, bridge_hid = [], ""
+        else:
+            offset, rate, control = playbacks.resolve(
+                hid, token, o / 1000.0, r / 1_000_000_000, "segment"
+            )
+            requested_cuts = parse_cuts_param(c) if c else []
+            cuts, bridge_hid, cuts_control = playbacks.resolve_cuts(
+                hid, token, requested_cuts, b, "segment"
+            )
         bridge_metadata = audio.metadata(bridge_hid) if bridge_hid else None
         _, fragment_path = await audio.fragment(hid, idx, offset, rate,
                                                 cuts=cuts, bridge_metadata=bridge_metadata)
         return _audio_response(fragment_path, "video/iso.segment", "no-cache",
-                               _audio_debug_headers(control, offset))
+                               _audio_debug_headers(control, offset, cuts_control))
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -659,6 +753,48 @@ async def dashboard_edit_player(playback_id: str, request: Request):
             if record else
             "Applied live in memory. Save it again after sync exposes a cache key to persist it."
         ),
+    }
+
+
+@app.patch("/api/dashboard/players/{playback_id}/cuts", include_in_schema=False)
+async def dashboard_edit_player_cuts(playback_id: str, request: Request):
+    _require_admin(request)
+    player = playbacks.get(playback_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="active playback not found")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="cuts edit must be an object")
+    cuts, bridge_hid = _cuts_values(body)
+    if bridge_hid:
+        if bridge_hid == player["hid"]:
+            raise HTTPException(status_code=400, detail="bridge audio must use a different track")
+        try:
+            audio.metadata(bridge_hid)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="bridge audio track is not available") from exc
+    updated = playbacks.set_cuts(playback_id, cuts, bridge_hid)
+    return {
+        "ok": True,
+        "player": updated,
+        "message": (
+            f"Saved {len(cuts)} cut{'s' if len(cuts) != 1 else ''}. "
+            "Restart playback or reload the HLS playlist to apply the new timeline."
+        ),
+    }
+
+
+@app.post("/api/dashboard/players/{playback_id}/cuts/restore", include_in_schema=False)
+async def dashboard_restore_player_cuts(playback_id: str, request: Request):
+    _require_admin(request)
+    try:
+        updated = playbacks.restore_request_cuts(playback_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "player": updated,
+        "message": "Restored the cuts carried by the player. Reload the HLS playlist to apply them.",
     }
 
 
